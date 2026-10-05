@@ -1,0 +1,237 @@
+{
+  "_note": "Simulated raw Okta Management API responses. Keys mirror the API endpoints; export_inventory.py converts this shape into the toolkit contract (see lib/inventory.py). In --live mode the same conversion runs against real paged API responses.",
+  "apiTokens": [
+    {
+      "clientName": "CI Pipeline",
+      "created": "2025-01-10T09:00:00.000Z",
+      "expiresAt": null,
+      "id": "00TAAA11111111111",
+      "lastUpdated": "2026-08-01T09:00:00.000Z",
+      "name": "ci-deploy",
+      "userId": "00uCCC33333333333"
+    }
+  ],
+  "appGroups": {
+    "0oaAAA11111111111": [
+      "00gBBB22222222222"
+    ]
+  },
+  "appUsers": {
+    "0oaAAA11111111111": [
+      "00uAAA11111111111",
+      "00uBBB22222222222"
+    ],
+    "0oaCCC33333333333": [
+      "00uAAA11111111111"
+    ]
+  },
+  "apps": [
+    {
+      "credentials": {
+        "scheme": "SHARED_USERNAME_AND_PASSWORD",
+        "userNameTemplate": {
+          "template": "${source.login}"
+        }
+      },
+      "id": "0oaAAA11111111111",
+      "label": "Slack",
+      "name": "slack",
+      "settings": {
+        "app": {
+          "domain": "example.slack.com"
+        },
+        "signOn": {
+          "assertionSigned": true,
+          "audience": "https://slack.com",
+          "responseSigned": true,
+          "ssoAcsUrl": "https://slack.com/sso/saml",
+          "subjectNameIdFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+        }
+      },
+      "signOnMode": "SAML_2_0",
+      "status": "ACTIVE"
+    },
+    {
+      "id": "0oaBBB22222222222",
+      "label": "Report Bot",
+      "name": "oidc_client",
+      "settings": {
+        "oauthClient": {
+          "client_id": "0oabReportBotClientId",
+          "grant_types": [
+            "client_credentials"
+          ],
+          "redirect_uris": [],
+          "response_types": [
+            "token"
+          ]
+        }
+      },
+      "signOnMode": "OPENID_CONNECT",
+      "status": "ACTIVE"
+    },
+    {
+      "id": "0oaCCC33333333333",
+      "label": "Company Wiki",
+      "name": "bookmark",
+      "settings": {
+        "app": {
+          "requestIntegration": false,
+          "url": "https://wiki.example.com"
+        }
+      },
+      "signOnMode": "BOOKMARK",
+      "status": "ACTIVE"
+    }
+  ],
+  "groupMembers": {
+    "00gAAA11111111111": [
+      "00uAAA11111111111",
+      "00uBBB22222222222"
+    ],
+    "00gBBB22222222222": [
+      "00uAAA11111111111"
+    ],
+    "00gCCC33333333333": [
+      "00uAAA11111111111",
+      "00uBBB22222222222",
+      "00uCCC33333333333"
+    ]
+  },
+  "groupRules": {
+    "00gAAA11111111111": {
+      "expression": "user.department == \"Engineering\"",
+      "status": "ACTIVE"
+    },
+    "00gCCC33333333333": {
+      "expression": "String.stringContains(user.email, \"@example.com\")",
+      "status": "ACTIVE"
+    }
+  },
+  "groups": [
+    {
+      "id": "00gAAA11111111111",
+      "profile": {
+        "description": "All engineering staff (dynamic)",
+        "name": "Engineering"
+      },
+      "type": "OKTA_GROUP"
+    },
+    {
+      "id": "00gBBB22222222222",
+      "profile": {
+        "description": "Slack workspace admins",
+        "name": "Slack Admins"
+      },
+      "type": "APP_GROUP"
+    },
+    {
+      "id": "00gCCC33333333333",
+      "profile": {
+        "description": "All active users",
+        "name": "Everyone"
+      },
+      "type": "OKTA_GROUP"
+    }
+  ],
+  "policies": [
+    {
+      "id": "00pAAA11111111111",
+      "name": "Default Policy",
+      "rules": [
+        {
+          "conditions": {
+            "people": {
+              "users": {
+                "exclude": [],
+                "include": []
+              }
+            }
+          },
+          "id": "0prAAA11111111111",
+          "name": "Allow MFA",
+          "status": "ACTIVE"
+        }
+      ],
+      "status": "ACTIVE",
+      "type": "OKTA_SIGN_ON"
+    }
+  ],
+  "users": [
+    {
+      "created": "2024-02-01T10:00:00.000Z",
+      "id": "00uAAA11111111111",
+      "profile": {
+        "department": "Engineering",
+        "email": "ada.lovelace@example.com",
+        "firstName": "Ada",
+        "lastName": "Lovelace",
+        "login": "ada.lovelace@example.com",
+        "manager": "grace.hopper@example.com",
+        "title": "Staff Engineer"
+      },
+      "status": "ACTIVE",
+      "credentials": {
+        "provider": {
+          "type": "OKTA",
+          "name": "OKTA"
+        }
+      }
+    },
+    {
+      "created": "2024-05-14T10:00:00.000Z",
+      "id": "00uBBB22222222222",
+      "profile": {
+        "department": "Engineering",
+        "email": "alan.turing@example.com",
+        "firstName": "Alan",
+        "lastName": "Turing",
+        "login": "alan.turing@example.com",
+        "title": "Engineer II",
+        "objectGUID": "6F8B3A2C-1D4E-4F5A-8B7C-9D0E1F2A3B4C"
+      },
+      "status": "ACTIVE",
+      "credentials": {
+        "provider": {
+          "type": "ACTIVE_DIRECTORY",
+          "name": "corp.example.com"
+        }
+      }
+    },
+    {
+      "created": "2023-11-02T10:00:00.000Z",
+      "id": "00uCCC33333333333",
+      "profile": {
+        "email": "svc-backup@example.com",
+        "firstName": "Backup",
+        "lastName": "Service",
+        "login": "svc-backup@example.com",
+        "userType": "SERVICE"
+      },
+      "status": "ACTIVE",
+      "credentials": {
+        "provider": {
+          "type": "OKTA",
+          "name": "OKTA"
+        }
+      }
+    },
+    {
+      "created": "2022-08-19T10:00:00.000Z",
+      "id": "00uDDD44444444444",
+      "profile": {
+        "email": "katherine.johnson@example.com",
+        "firstName": "Katherine",
+        "lastName": "Johnson",
+        "login": "katherine.johnson@example.com"
+      },
+      "status": "DEPROVISIONED",
+      "credentials": {
+        "provider": {
+          "type": "OKTA",
+          "name": "OKTA"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,260 @@
+{
+  "users": [
+    {
+      "id": "00uAAA11111111111",
+      "login": "ada.lovelace@example.com",
+      "email": "ada.lovelace@example.com",
+      "firstName": "Ada",
+      "lastName": "Lovelace",
+      "status": "ACTIVE",
+      "userType": "USER",
+      "credentialProvider": "OKTA",
+      "department": "Engineering",
+      "title": "Staff Engineer",
+      "manager": "grace.hopper@example.com",
+      "groups": [
+        "00gAAA11111111111",
+        "00gBBB22222222222",
+        "00gCCC33333333333"
+      ],
+      "apps": [
+        "0oaAAA11111111111",
+        "0oaCCC33333333333"
+      ],
+      "profile": {
+        "department": "Engineering",
+        "email": "ada.lovelace@example.com",
+        "firstName": "Ada",
+        "lastName": "Lovelace",
+        "login": "ada.lovelace@example.com",
+        "manager": "grace.hopper@example.com",
+        "title": "Staff Engineer"
+      }
+    },
+    {
+      "id": "00uBBB22222222222",
+      "login": "alan.turing@example.com",
+      "email": "alan.turing@example.com",
+      "firstName": "Alan",
+      "lastName": "Turing",
+      "status": "ACTIVE",
+      "userType": "USER",
+      "credentialProvider": "ACTIVE_DIRECTORY",
+      "department": "Engineering",
+      "title": "Engineer II",
+      "manager": null,
+      "groups": [
+        "00gAAA11111111111",
+        "00gCCC33333333333"
+      ],
+      "apps": [
+        "0oaAAA11111111111"
+      ],
+      "profile": {
+        "department": "Engineering",
+        "email": "alan.turing@example.com",
+        "firstName": "Alan",
+        "lastName": "Turing",
+        "login": "alan.turing@example.com",
+        "title": "Engineer II",
+        "objectGUID": "6F8B3A2C-1D4E-4F5A-8B7C-9D0E1F2A3B4C"
+      }
+    },
+    {
+      "id": "00uCCC33333333333",
+      "login": "svc-backup@example.com",
+      "email": "svc-backup@example.com",
+      "firstName": "Backup",
+      "lastName": "Service",
+      "status": "ACTIVE",
+      "userType": "SERVICE",
+      "credentialProvider": "OKTA",
+      "department": null,
+      "title": null,
+      "manager": null,
+      "groups": [
+        "00gCCC33333333333"
+      ],
+      "apps": [],
+      "profile": {
+        "email": "svc-backup@example.com",
+        "firstName": "Backup",
+        "lastName": "Service",
+        "login": "svc-backup@example.com",
+        "userType": "SERVICE"
+      }
+    },
+    {
+      "id": "00uDDD44444444444",
+      "login": "katherine.johnson@example.com",
+      "email": "katherine.johnson@example.com",
+      "firstName": "Katherine",
+      "lastName": "Johnson",
+      "status": "DEPROVISIONED",
+      "userType": "USER",
+      "credentialProvider": "OKTA",
+      "department": null,
+      "title": null,
+      "manager": null,
+      "groups": [],
+      "apps": [],
+      "profile": {
+        "email": "katherine.johnson@example.com",
+        "firstName": "Katherine",
+        "lastName": "Johnson",
+        "login": "katherine.johnson@example.com"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "id": "00gAAA11111111111",
+      "name": "Engineering",
+      "description": "All engineering staff (dynamic)",
+      "type": "OKTA_GROUP",
+      "members": [
+        "00uAAA11111111111",
+        "00uBBB22222222222"
+      ],
+      "assignedApps": [],
+      "dynamicRule": "user.department == \"Engineering\"",
+      "dynamicRuleStatus": "ACTIVE"
+    },
+    {
+      "id": "00gBBB22222222222",
+      "name": "Slack Admins",
+      "description": "Slack workspace admins",
+      "type": "APP_GROUP",
+      "members": [
+        "00uAAA11111111111"
+      ],
+      "assignedApps": [
+        "0oaAAA11111111111"
+      ],
+      "dynamicRule": null,
+      "dynamicRuleStatus": null
+    },
+    {
+      "id": "00gCCC33333333333",
+      "name": "Everyone",
+      "description": "All active users",
+      "type": "OKTA_GROUP",
+      "members": [
+        "00uAAA11111111111",
+        "00uBBB22222222222",
+        "00uCCC33333333333"
+      ],
+      "assignedApps": [],
+      "dynamicRule": "String.stringContains(user.email, \"@example.com\")",
+      "dynamicRuleStatus": "ACTIVE"
+    }
+  ],
+  "apps": [
+    {
+      "id": "0oaAAA11111111111",
+      "name": "slack",
+      "label": "Slack",
+      "status": "ACTIVE",
+      "signOnMode": "SAML_2_0",
+      "sso": {
+        "issuer": "http://www.okta.com/0oaAAA11111111111",
+        "audience": "https://slack.com",
+        "subjectNameIdFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+      },
+      "assignedGroups": [
+        "00gBBB22222222222"
+      ],
+      "assignedUsers": [
+        "00uAAA11111111111",
+        "00uBBB22222222222"
+      ],
+      "owner": null
+    },
+    {
+      "id": "0oaBBB22222222222",
+      "name": "oidc_client",
+      "label": "Report Bot",
+      "status": "ACTIVE",
+      "signOnMode": "OPENID_CONNECT",
+      "sso": {
+        "issuer": "http://www.okta.com/0oaBBB22222222222",
+        "clientId": "0oabReportBotClientId",
+        "grantTypes": [
+          "client_credentials"
+        ]
+      },
+      "assignedGroups": [],
+      "assignedUsers": [],
+      "owner": null
+    },
+    {
+      "id": "0oaCCC33333333333",
+      "name": "bookmark",
+      "label": "Company Wiki",
+      "status": "ACTIVE",
+      "signOnMode": "BOOKMARK",
+      "sso": {
+        "issuer": "http://www.okta.com/0oaCCC33333333333",
+        "url": "https://wiki.example.com"
+      },
+      "assignedGroups": [],
+      "assignedUsers": [
+        "00uAAA11111111111"
+      ],
+      "owner": null
+    }
+  ],
+  "policies": [
+    {
+      "id": "00pAAA11111111111",
+      "name": "Default Policy",
+      "type": "OKTA_SIGN_ON",
+      "status": "ACTIVE",
+      "rules": [
+        {
+          "id": "0prAAA11111111111",
+          "name": "Allow MFA",
+          "status": "ACTIVE",
+          "conditions": {
+            "people": {
+              "users": {
+                "exclude": [],
+                "include": []
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "apiTokens": [
+    {
+      "id": "00TAAA11111111111",
+      "name": "ci-deploy",
+      "clientName": "CI Pipeline",
+      "userId": "00uCCC33333333333",
+      "created": "2025-01-10T09:00:00.000Z",
+      "lastUpdated": "2026-08-01T09:00:00.000Z",
+      "expiresAt": null
+    }
+  ],
+  "oauthApps": [
+    {
+      "id": "0oaBBB22222222222",
+      "name": "oidc_client",
+      "label": "Report Bot",
+      "status": "ACTIVE",
+      "clientId": "0oabReportBotClientId",
+      "grantTypes": [
+        "client_credentials"
+      ],
+      "redirectUris": [],
+      "scopes": []
+    }
+  ],
+  "exportedAt": "2026-09-30T07:13:56Z",
+  "source": {
+    "live": false,
+    "rawFile": "fixtures/okta-raw.sample.json"
+  }
+}
