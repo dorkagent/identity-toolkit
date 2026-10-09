@@ -1,0 +1,8 @@
+# Run artefacts: may hold tenant data or secrets
+*.journal.jsonl
+toolkit.audit.jsonl
+*.parts/
+okta-inventory.json
+taps*.tsv
+.pytest_cache/
+.ruff_cache/
