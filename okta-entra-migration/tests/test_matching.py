@@ -1,4 +1,4 @@
-"""Unit tests: user matching tiers + identity-safety guards (P0-6)."""
+"""Unit tests: user matching tiers + identity-safety guards."""
 
 import unittest
 
