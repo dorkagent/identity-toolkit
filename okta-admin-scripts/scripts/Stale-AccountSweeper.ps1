@@ -87,7 +87,12 @@ try {
     }
 } catch {
     if ($_.Exception.Data['StatusCode'] -ne 403) { throw }
-    Write-Warning 'Cannot list API tokens (needs super admin); only the current token owner is protected.'
+    if ($me) {
+        Write-Warning 'Cannot list API tokens (needs super admin); only the current token owner is protected.'
+    } else {
+        # OAuth service apps have no user behind them, so nothing is protected here.
+        Write-Warning 'Cannot list API tokens (needs super admin and, for OAuth, okta.apiTokens.read); no API token owners are protected. List them in -ExcludeFile.'
+    }
 }
 try {
     foreach ($uid in Get-OktaRoleAssigneeUserIds -Client $client) {
