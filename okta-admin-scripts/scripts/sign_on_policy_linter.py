@@ -1,201 +1,150 @@
 #!/usr/bin/env python3
-"""Sign-on policy linter (DHQ-81). READ-ONLY.
+"""Lint Okta sign-on policy rules for weak settings (read-only).
 
-Scans OKTA_SIGN_ON policies and their rules for weak configurations:
+Checks, using fields that exist in the policy rule schemas:
 
-  (a) PASSWORD-ONLY: rules where actions.signon.requireFactor is false,
-      i.e. the rule grants access with no MFA requirement.
-  (b) DEVICE-ASSURANCE (heuristic): rules granting access whose conditions
-      contain no mention of "device" (device trust / device assurance).
-  (c) OVER-BROAD NETWORK ZONES: rules attached to network connection
-      "ANYWHERE", or referencing gateway CIDRs with a prefix shorter than
-      --min-zone-prefix (default 16), including 0.0.0.0/0.
+    no-mfa (OKTA_SIGN_ON rules)
+        actions.signon.access ALLOW with requireFactor false. On Classic
+        orgs this means password-only sign-in: HIGH. On Identity Engine
+        orgs OKTA_SIGN_ON is the global session policy and MFA is usually
+        enforced per app in ACCESS_POLICY rules, so it is reported as INFO.
 
-Usage:
-    export OKTA_DOMAIN=https://dev-123456.okta.com
-    export OKTA_API_TOKEN=00...
-    python scripts/python/sign_on_policy_linter.py
-    python scripts/python/sign_on_policy_linter.py --min-zone-prefix 24
-    python scripts/python/sign_on_policy_linter.py --limit 5
-    python scripts/python/sign_on_policy_linter.py --json --output findings.json
+    one-factor (ACCESS_POLICY rules, Identity Engine)
+        actions.appSignOn.access ALLOW with verificationMethod.factorMode
+        1FA: MEDIUM. Rules that only apply to password-recovery requests are
+        skipped because one factor is normal there.
+
+    network-anywhere / wide-zone
+        A rule allowing access from ANYWHERE (LOW, it is Okta's default), or
+        whose included network zone has a CIDR gateway wider than
+        --min-zone-prefix (MEDIUM, HIGH for 0.0.0.0/0).
+
+The engine is detected by whether the org has any ACCESS_POLICY policies.
+
+Examples:
+    python scripts/sign_on_policy_linter.py
+    python scripts/sign_on_policy_linter.py --min-zone-prefix 24 --json
 """
 
 from __future__ import annotations
 
 import argparse
 import ipaddress
-import json
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.okta_client import OktaClient, OktaAuthError
+from lib.common import connect
+from lib.okta_client import OktaApiError
+from lib.output import emit, table
 
 
-def signon_actions(rule: dict) -> dict:
-    return rule.get("actions", {}).get("signon", {})
+def finding(policy, rule, check, severity, detail) -> dict:
+    return {"policy": policy.get("name"), "policy_type": policy.get("type"),
+            "rule": rule.get("name"), "check": check, "severity": severity,
+            "detail": detail}
 
 
-def grants_access(rule: dict) -> bool:
-    """A rule that grants access is anything not explicitly DENY."""
-    return signon_actions(rule).get("access") != "DENY"
+def check_global_session_rule(policy: dict, rule: dict, oie: bool) -> list[dict]:
+    signon = (rule.get("actions") or {}).get("signon") or {}
+    if signon.get("access") == "ALLOW" and signon.get("requireFactor") is False:
+        if oie:
+            return [finding(policy, rule, "no-mfa", "INFO",
+                            "global session rule does not require MFA; make sure "
+                            "app sign-in policies do")]
+        return [finding(policy, rule, "no-mfa", "HIGH",
+                        "rule allows sign-in with a password only")]
+    return []
 
 
-def check_password_only(policy_name: str, rule: dict) -> dict | None:
-    actions = signon_actions(rule)
-    if grants_access(rule) and actions.get("requireFactor") is False:
-        return {
-            "policy": policy_name,
-            "rule": rule.get("name"),
-            "check": "password-only",
-            "severity": "HIGH",
-            "detail": (
-                f"access={actions.get('access')}, requireFactor=false: "
-                "rule grants access without any MFA requirement"
-            ),
-        }
-    return None
+def _is_recovery_only(rule: dict) -> bool:
+    cond = (((rule.get("conditions") or {}).get("elCondition") or {}).get("condition") or "")
+    return "accessRequest.operation=='recover'" in cond.replace(" ", "")
 
 
-def check_device_assurance(policy_name: str, rule: dict) -> dict | None:
-    conditions = rule.get("conditions", {})
-    if grants_access(rule) and "device" not in json.dumps(conditions).lower():
-        return {
-            "policy": policy_name,
-            "rule": rule.get("name"),
-            "check": "device-assurance",
-            "severity": "LOW",
-            "detail": (
-                "heuristic: no 'device' mention in rule conditions; "
-                "consider a device-trust / device-assurance condition"
-            ),
-        }
-    return None
+def check_app_sign_in_rule(policy: dict, rule: dict) -> list[dict]:
+    app = (rule.get("actions") or {}).get("appSignOn") or {}
+    method = app.get("verificationMethod") or {}
+    if (app.get("access") == "ALLOW" and method.get("factorMode") == "1FA"
+            and not _is_recovery_only(rule)):
+        return [finding(policy, rule, "one-factor", "MEDIUM",
+                        "app sign-in rule allows access with one factor")]
+    return []
 
 
-def zone_gateways(zone: dict) -> list:
-    """Return the CIDR gateway values for an IP network zone."""
-    cidrs = []
-    for gw in zone.get("gateways", []) or []:
-        if gw.get("type") == "CIDR" and gw.get("value"):
-            cidrs.append(gw["value"])
-    return cidrs
+def zone_cidrs(zone: dict) -> list[str]:
+    return [g["value"] for g in (zone.get("gateways") or [])
+            if g.get("type") == "CIDR" and g.get("value")]
 
 
-def check_network_zones(policy_name: str, rule: dict, zones: dict,
-                         min_prefix: int) -> list:
-    findings = []
-    if not grants_access(rule):
-        return findings
-    network = rule.get("conditions", {}).get("network", {})
+def check_network(policy: dict, rule: dict, zones: dict, min_prefix: int) -> list[dict]:
+    actions = rule.get("actions") or {}
+    access = ((actions.get("signon") or actions.get("appSignOn") or {}).get("access"))
+    if access != "ALLOW":
+        return []
+    network = (rule.get("conditions") or {}).get("network") or {}
+    out = []
     if network.get("connection") == "ANYWHERE":
-        findings.append({
-            "policy": policy_name,
-            "rule": rule.get("name"),
-            "check": "network-zone",
-            "severity": "MEDIUM",
-            "detail": "rule attached to network connection ANYWHERE",
-        })
-    for zone_id in network.get("include", []) or []:
+        out.append(finding(policy, rule, "network-anywhere", "LOW",
+                           "rule applies from any network"))
+    for zone_id in network.get("include") or []:
         zone = zones.get(zone_id)
-        if zone is None:
+        if not zone:
             continue
-        for cidr in zone_gateways(zone):
+        for cidr in zone_cidrs(zone):
             try:
                 net = ipaddress.ip_network(cidr, strict=False)
             except ValueError:
                 continue
-            if str(net) == "0.0.0.0/0" or net.prefixlen < min_prefix:
-                findings.append({
-                    "policy": policy_name,
-                    "rule": rule.get("name"),
-                    "check": "network-zone",
-                    "severity": "HIGH" if net.prefixlen == 0 else "MEDIUM",
-                    "detail": (
-                        f"zone '{zone.get('name')}' includes CIDR {net} "
-                        f"(prefix {net.prefixlen} < minimum {min_prefix})"
-                    ),
-                })
-    return findings
+            if net.prefixlen < min_prefix:
+                out.append(finding(policy, rule, "wide-zone",
+                                   "HIGH" if net.prefixlen == 0 else "MEDIUM",
+                                   f"zone '{zone.get('name')}' includes {net}"))
+    return out
 
 
-def lint(client: OktaClient, limit: int = 0, min_prefix: int = 16,
-         progress_every: int = 10):
-    findings = []
+def lint(client, min_prefix: int = 16) -> tuple[list[dict], dict]:
     zones = {z.get("id"): z for z in client.list_zones()}
-    policies = list(client.list_policies("OKTA_SIGN_ON"))
-    for n, policy in enumerate(policies, 1):
-        if limit and n > limit:
-            break
-        policy_name = policy.get("name")
-        for rule in client.list_policy_rules(policy.get("id")):
-            for finding in (
-                check_password_only(policy_name, rule),
-                check_device_assurance(policy_name, rule),
-            ):
-                if finding:
-                    findings.append(finding)
-            findings.extend(check_network_zones(policy_name, rule, zones,
-                                                min_prefix))
-        if n % progress_every == 0:
-            print(f"... linted {n} policies", file=sys.stderr)
-    return findings, len(policies)
-
-
-def print_table(findings: list):
-    print(f"{'POLICY':28} {'RULE':28} {'CHECK':16} {'SEV':6} DETAIL")
-    print("-" * 130)
-    for f in findings:
-        print(f"{(f['policy'] or '')[:28]:28} {(f['rule'] or '')[:28]:28} "
-              f"{f['check'][:16]:16} {f['severity']:6} {f['detail']}")
-
-
-def main():
-    p = argparse.ArgumentParser(
-        description="Lint OKTA_SIGN_ON policies for weak auth configurations. READ-ONLY.")
-    p.add_argument("--limit", type=int, default=0,
-                   help="only lint N policies (0 = all)")
-    p.add_argument("--min-zone-prefix", type=int, default=16,
-                   help="flag gateway CIDRs with a prefix shorter than this (default 16)")
-    p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    p.add_argument("--output", default=None, help="write report to file")
-    args = p.parse_args()
-
     try:
-        client = OktaClient()
-    except OktaAuthError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+        access_policies = list(client.list_policies("ACCESS_POLICY"))
+    except OktaApiError:
+        access_policies = []  # Classic orgs reject the type
+    oie = bool(access_policies)
+    findings = []
+    policies = [(p, "OKTA_SIGN_ON") for p in client.list_policies("OKTA_SIGN_ON")]
+    policies += [(p, "ACCESS_POLICY") for p in access_policies]
+    for policy, ptype in policies:
+        for rule in client.list_policy_rules(policy["id"]):
+            if rule.get("status") == "INACTIVE":
+                continue
+            if ptype == "OKTA_SIGN_ON":
+                findings += check_global_session_rule(policy, rule, oie)
+            else:
+                findings += check_app_sign_in_rule(policy, rule)
+            findings += check_network(policy, rule, zones, min_prefix)
+    order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+    findings.sort(key=lambda f: (order.get(f["severity"], 9), f["policy"] or ""))
+    return findings, {"engine": "Identity Engine" if oie else "Classic",
+                      "policies": len(policies)}
 
-    findings, policy_count = lint(client, limit=args.limit,
-                                 min_prefix=args.min_zone_prefix)
 
-    severities = {}
-    for f in findings:
-        severities[f["severity"]] = severities.get(f["severity"], 0) + 1
-    summary = {"policies_linted": policy_count, "findings": len(findings),
-               **severities}
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Lint Okta sign-on and app sign-in "
+                                "policy rules (read-only).")
+    p.add_argument("--min-zone-prefix", type=int, default=16,
+                   help="flag zone CIDRs wider than this prefix (default 16)")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.add_argument("--output", help="write the report here (.csv for CSV)")
+    args = p.parse_args(argv)
 
-    if args.json:
-        report = json.dumps({"summary": summary, "findings": findings}, indent=2)
-    else:
-        print_table(findings)
-        sev = ", ".join(f"{k}: {v}" for k, v in sorted(severities.items()))
-        report_lines = [
-            "",
-            f"Policies: {summary['policies_linted']} | "
-            f"findings: {summary['findings']}"
-            + (f" ({sev})" if sev else ""),
-        ]
-        report = "\n".join(report_lines)
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report if args.json else report + "\n")
-        print(f"\nwrote {args.output}", file=sys.stderr)
-    elif not args.json:
-        print(report)
+    findings, meta = lint(connect(), args.min_zone_prefix)
+    text = table([("SEV", 6), ("POLICY", 28), ("RULE", 28), ("CHECK", 16), ("DETAIL", 0)],
+                 [[f["severity"], f["policy"], f["rule"], f["check"], f["detail"]]
+                  for f in findings])
+    text += f"\n\n{meta['engine']}: {meta['policies']} policies, {len(findings)} findings"
+    emit(report={"summary": {**meta, "findings": len(findings)}, "findings": findings},
+         text=text, as_json=args.json, output=args.output, csv_rows=findings)
 
 
 if __name__ == "__main__":
