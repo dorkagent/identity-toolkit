@@ -1,5 +1,5 @@
 {
-  "_note": "Simulated raw Okta Management API responses. Keys mirror the API endpoints; export_inventory.py converts this shape into the toolkit contract (see lib/inventory.py). In --live mode the same conversion runs against real paged API responses.",
+  "_note": "Simulated raw Okta Management API responses, shaped after the Okta Management OpenAPI spec (GroupRule, AppUser.scope, SamlApplicationSettingsSignOn). Keys mirror the endpoints; export_inventory.py converts this into the inventory. Timestamps are kept as the API returns them in this lab (human-readable).",
   "apiTokens": [
     {
       "clientName": "CI Pipeline",
@@ -14,7 +14,19 @@
   "appGroups": {
     "0oaAAA11111111111": [
       "00gBBB22222222222"
+    ],
+    "0oaDDD44444444444": [
+      "00gCCC33333333333"
     ]
+  },
+  "appUserScopes": {
+    "0oaAAA11111111111": {
+      "00uAAA11111111111": "USER",
+      "00uBBB22222222222": "GROUP"
+    },
+    "0oaCCC33333333333": {
+      "00uAAA11111111111": "USER"
+    }
   },
   "appUsers": {
     "0oaAAA11111111111": [
@@ -43,6 +55,8 @@
         "signOn": {
           "assertionSigned": true,
           "audience": "https://slack.com",
+          "destination": "https://slack.com/sso/saml",
+          "recipient": "https://slack.com/sso/saml",
           "responseSigned": true,
           "ssoAcsUrl": "https://slack.com/sso/saml",
           "subjectNameIdFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
@@ -82,6 +96,18 @@
       },
       "signOnMode": "BOOKMARK",
       "status": "ACTIVE"
+    },
+    {
+      "id": "0oaDDD44444444444",
+      "label": "Microsoft Office 365",
+      "name": "office365",
+      "settings": {
+        "app": {
+          "domain": "example.com"
+        }
+      },
+      "signOnMode": "WS_FEDERATION",
+      "status": "ACTIVE"
     }
   ],
   "groupMembers": {
@@ -96,18 +122,107 @@
       "00uAAA11111111111",
       "00uBBB22222222222",
       "00uCCC33333333333"
+    ],
+    "00gDDD44444444444": [
+      "00uFFF66666666666",
+      "00uGGG77777777777"
+    ],
+    "00gEEE55555555555": [
+      "00uGGG77777777777"
+    ],
+    "00gFFF66666666666": [
+      "00uAAA11111111111",
+      "00uBBB22222222222",
+      "00uCCC33333333333",
+      "00uEEE55555555555",
+      "00uFFF66666666666",
+      "00uGGG77777777777",
+      "00uHHH88888888888"
     ]
   },
-  "groupRules": {
-    "00gAAA11111111111": {
-      "expression": "user.department == \"Engineering\"",
-      "status": "ACTIVE"
+  "groupRules": [
+    {
+      "actions": {
+        "assignUserToGroups": {
+          "groupIds": [
+            "00gAAA11111111111"
+          ]
+        }
+      },
+      "conditions": {
+        "expression": {
+          "type": "urn:okta:expression:1.0",
+          "value": "user.department == \"Engineering\""
+        },
+        "people": {
+          "groups": {
+            "exclude": []
+          },
+          "users": {
+            "exclude": []
+          }
+        }
+      },
+      "id": "0prRULE1111111111",
+      "name": "Engineering by department",
+      "status": "ACTIVE",
+      "type": "group_rule"
     },
-    "00gCCC33333333333": {
-      "expression": "String.stringContains(user.email, \"@example.com\")",
-      "status": "ACTIVE"
+    {
+      "actions": {
+        "assignUserToGroups": {
+          "groupIds": [
+            "00gCCC33333333333"
+          ]
+        }
+      },
+      "conditions": {
+        "expression": {
+          "type": "urn:okta:expression:1.0",
+          "value": "String.stringContains(user.email, \"@example.com\")"
+        },
+        "people": {
+          "groups": {
+            "exclude": []
+          },
+          "users": {
+            "exclude": []
+          }
+        }
+      },
+      "id": "0prRULE2222222222",
+      "name": "All example.com staff",
+      "status": "ACTIVE",
+      "type": "group_rule"
+    },
+    {
+      "actions": {
+        "assignUserToGroups": {
+          "groupIds": [
+            "00gDDD44444444444"
+          ]
+        }
+      },
+      "conditions": {
+        "expression": {
+          "type": "urn:okta:expression:1.0",
+          "value": "user.costCenter == \"FIN-100\" AND user.department == \"Finance\""
+        },
+        "people": {
+          "groups": {
+            "exclude": []
+          },
+          "users": {
+            "exclude": []
+          }
+        }
+      },
+      "id": "0prRULE3333333333",
+      "name": "Finance cost centre",
+      "status": "ACTIVE",
+      "type": "group_rule"
     }
-  },
+  ],
   "groups": [
     {
       "id": "00gAAA11111111111",
@@ -128,10 +243,34 @@
     {
       "id": "00gCCC33333333333",
       "profile": {
-        "description": "All active users",
-        "name": "Everyone"
+        "description": "Everyone with an example.com address",
+        "name": "All Staff"
       },
       "type": "OKTA_GROUP"
+    },
+    {
+      "id": "00gDDD44444444444",
+      "profile": {
+        "description": "Finance cost centre",
+        "name": "Finance"
+      },
+      "type": "OKTA_GROUP"
+    },
+    {
+      "id": "00gEEE55555555555",
+      "profile": {
+        "description": "Assigned by hand",
+        "name": "Contractors"
+      },
+      "type": "OKTA_GROUP"
+    },
+    {
+      "id": "00gFFF66666666666",
+      "profile": {
+        "description": "All users in your organization",
+        "name": "Everyone"
+      },
+      "type": "BUILT_IN"
     }
   ],
   "policies": [
@@ -155,11 +294,48 @@
       ],
       "status": "ACTIVE",
       "type": "OKTA_SIGN_ON"
+    },
+    {
+      "id": "rstAAA11111111111",
+      "name": "Slack app sign-in",
+      "rules": [
+        {
+          "actions": {
+            "appSignOn": {
+              "access": "ALLOW",
+              "verificationMethod": {
+                "factorMode": "2FA",
+                "type": "ASSURANCE"
+              }
+            }
+          },
+          "conditions": {
+            "network": {
+              "connection": "ZONE",
+              "exclude": [
+                "nzoCORP"
+              ]
+            }
+          },
+          "id": "rulAAA11111111111",
+          "name": "Require MFA off-network",
+          "status": "ACTIVE"
+        }
+      ],
+      "status": "ACTIVE",
+      "system": false,
+      "type": "ACCESS_POLICY"
     }
   ],
   "users": [
     {
       "created": "2024-02-01T10:00:00.000Z",
+      "credentials": {
+        "provider": {
+          "name": "OKTA",
+          "type": "OKTA"
+        }
+      },
       "id": "00uAAA11111111111",
       "profile": {
         "department": "Engineering",
@@ -170,16 +346,16 @@
         "manager": "grace.hopper@example.com",
         "title": "Staff Engineer"
       },
-      "status": "ACTIVE",
-      "credentials": {
-        "provider": {
-          "type": "OKTA",
-          "name": "OKTA"
-        }
-      }
+      "status": "ACTIVE"
     },
     {
       "created": "2024-05-14T10:00:00.000Z",
+      "credentials": {
+        "provider": {
+          "name": "corp.example.com",
+          "type": "ACTIVE_DIRECTORY"
+        }
+      },
       "id": "00uBBB22222222222",
       "profile": {
         "department": "Engineering",
@@ -187,19 +363,19 @@
         "firstName": "Alan",
         "lastName": "Turing",
         "login": "alan.turing@example.com",
-        "title": "Engineer II",
-        "objectGUID": "6F8B3A2C-1D4E-4F5A-8B7C-9D0E1F2A3B4C"
+        "objectGUID": "6F8B3A2C-1D4E-4F5A-8B7C-9D0E1F2A3B4C",
+        "title": "Engineer II"
       },
-      "status": "ACTIVE",
-      "credentials": {
-        "provider": {
-          "type": "ACTIVE_DIRECTORY",
-          "name": "corp.example.com"
-        }
-      }
+      "status": "ACTIVE"
     },
     {
       "created": "2023-11-02T10:00:00.000Z",
+      "credentials": {
+        "provider": {
+          "name": "OKTA",
+          "type": "OKTA"
+        }
+      },
       "id": "00uCCC33333333333",
       "profile": {
         "email": "svc-backup@example.com",
@@ -208,16 +384,16 @@
         "login": "svc-backup@example.com",
         "userType": "SERVICE"
       },
-      "status": "ACTIVE",
-      "credentials": {
-        "provider": {
-          "type": "OKTA",
-          "name": "OKTA"
-        }
-      }
+      "status": "ACTIVE"
     },
     {
       "created": "2022-08-19T10:00:00.000Z",
+      "credentials": {
+        "provider": {
+          "name": "OKTA",
+          "type": "OKTA"
+        }
+      },
       "id": "00uDDD44444444444",
       "profile": {
         "email": "katherine.johnson@example.com",
@@ -225,13 +401,85 @@
         "lastName": "Johnson",
         "login": "katherine.johnson@example.com"
       },
-      "status": "DEPROVISIONED",
+      "status": "DEPROVISIONED"
+    },
+    {
+      "created": "Mon 2025-03-03 9:00 AM PST (UTC-08:00)",
       "credentials": {
         "provider": {
-          "type": "OKTA",
-          "name": "OKTA"
+          "name": "OKTA",
+          "type": "OKTA"
         }
-      }
+      },
+      "id": "00uEEE55555555555",
+      "profile": {
+        "countryCode": "IE",
+        "department": "Finance",
+        "email": "o.brien@example.com",
+        "firstName": "Siobhan",
+        "lastName": "O'Brien",
+        "login": "o.brien+test@example.com"
+      },
+      "status": "ACTIVE"
+    },
+    {
+      "created": "Mon 2025-03-03 9:00 AM PST (UTC-08:00)",
+      "credentials": {
+        "provider": {
+          "name": "OKTA",
+          "type": "OKTA"
+        }
+      },
+      "id": "00uFFF66666666666",
+      "profile": {
+        "city": "Arlington",
+        "costCenter": "FIN-100",
+        "countryCode": "US",
+        "department": "Finance",
+        "email": "grace.hopper@example.com",
+        "firstName": "Grace",
+        "lastName": "Hopper",
+        "login": "grace.hopper@example.com"
+      },
+      "status": "STAGED"
+    },
+    {
+      "created": "Mon 2025-03-03 9:00 AM PST (UTC-08:00)",
+      "credentials": {
+        "provider": {
+          "name": "OKTA",
+          "type": "OKTA"
+        }
+      },
+      "id": "00uGGG77777777777",
+      "profile": {
+        "costCenter": "FIN-100",
+        "countryCode": "GB",
+        "department": "Finance",
+        "email": "mary.jackson@example.com",
+        "firstName": "Mary",
+        "lastName": "Jackson",
+        "login": "mary.jackson@example.com",
+        "title": "Analyst"
+      },
+      "status": "LOCKED_OUT"
+    },
+    {
+      "created": "Mon 2025-03-03 9:00 AM PST (UTC-08:00)",
+      "credentials": {
+        "provider": {
+          "name": "OKTA",
+          "type": "OKTA"
+        }
+      },
+      "id": "00uHHH88888888888",
+      "profile": {
+        "email": "sobrien@example.com",
+        "firstName": "S",
+        "lastName": "OBrien",
+        "login": "sobrien@example.com"
+      },
+      "status": "ACTIVE"
     }
   ]
 }
