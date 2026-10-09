@@ -1,169 +1,205 @@
 #!/usr/bin/env python3
-"""Stale account sweeper (DHQ-82).
+"""Find dormant Okta accounts and, if asked, suspend or deactivate them.
 
-Finds ACTIVE users whose accounts look dormant:
+An ACTIVE user is flagged when:
+  DORMANT          lastLogin is older than --days
+  NEVER_LOGGED_IN  there is no lastLogin and the account is older than --days
 
-  - DORMANT: lastLogin older than --days (default 90).
-  - NEVER_LOGGED_IN: no lastLogin at all and created older than --days.
+lastLogin is the last Okta sign-in, not the last use of any app.
 
-DRY-RUN BY DEFAULT. Actual deactivation (POST
-/api/v1/users/{id}/lifecycle/deactivate) only happens when BOTH --disable
-AND --confirm are passed.
+Some accounts never sign in interactively and still matter: service accounts
+that own API tokens, provisioning accounts, break-glass admins. Okta revokes a
+user's API tokens when the user is deactivated, so sweeping those accounts can
+break integrations, including the token this script runs on. Before acting the
+script skips:
+  - the user that owns the current API token (GET /api/v1/users/me)
+  - owners of any active API token (GET /api/v1/api-tokens, super admin only)
+  - every admin-role holder (GET /api/v1/iam/assignees/users)
+  - logins or user IDs listed in --exclude-file, and members of --exclude-group
 
-Usage:
-    export OKTA_DOMAIN=https://dev-123456.okta.com
-    export OKTA_API_TOKEN=00...
-    python scripts/python/stale_account_sweeper.py
-    python scripts/python/stale_account_sweeper.py --days 180
-    python scripts/python/stale_account_sweeper.py --json --output stale.json
-    python scripts/python/stale_account_sweeper.py --output stale.csv
-    python scripts/python/stale_account_sweeper.py --disable --confirm   # live run
+Nothing changes without --apply. The default action is suspend, which is
+reversible; --action deactivate is the harder option. --limit caps how many
+accounts are acted on, and --max aborts before any change if more accounts
+than that would be touched.
+
+Examples:
+    python scripts/stale_account_sweeper.py
+    python scripts/stale_account_sweeper.py --days 180 --output stale.csv
+    python scripts/stale_account_sweeper.py --exclude-file keep.txt --exclude-group "Service Accounts"
+    python scripts/stale_account_sweeper.py --apply --limit 10            # suspend 10
+    python scripts/stale_account_sweeper.py --apply --action deactivate --max 50
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import io
-import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.okta_client import OktaClient, OktaAuthError
+from lib.common import connect, parse_ts
+from lib.okta_client import OktaClient, OktaError, OktaForbiddenError
+from lib.output import emit, table
+
+LIFECYCLE_PATH = {
+    "suspend": "/api/v1/users/{id}/lifecycle/suspend",
+    "deactivate": "/api/v1/users/{id}/lifecycle/deactivate",
+}
 
 
-def parse_ts(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        # Okta timestamps are ISO8601, e.g. 2026-09-01T12:34:56.000Z
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-def sweep(client: OktaClient, days: int, progress_every: int = 100):
-    now = datetime.now(timezone.utc)
+def find_stale(users, days: int, now: datetime | None = None) -> list[dict]:
+    now = now or datetime.now(UTC)
     rows = []
-    for n, user in enumerate(client.list_users(status="ACTIVE"), 1):
-        profile = user.get("profile", {})
-        login = profile.get("login")
+    for user in users:
+        profile = user.get("profile") or {}
         last_login = parse_ts(user.get("lastLogin"))
         if last_login is not None:
-            dormant_days = (now - last_login).days
-            if dormant_days < days:
-                continue
+            idle = (now - last_login).days
             category = "DORMANT"
         else:
             created = parse_ts(user.get("created"))
-            dormant_days = (now - created).days if created else None
-            if dormant_days is None or dormant_days < days:
+            if created is None:
                 continue
+            idle = (now - created).days
             category = "NEVER_LOGGED_IN"
+        if idle < days:
+            continue
         rows.append({
-            "login": login,
-            "name": f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip(),
-            "last_login": user.get("lastLogin"),
-            "days_dormant": dormant_days,
-            "category": category,
             "user_id": user.get("id"),
-            "action": "would deactivate",
+            "login": profile.get("login"),
+            "name": f"{profile.get('firstName') or ''} {profile.get('lastName') or ''}".strip(),
+            "last_login": user.get("lastLogin"),
+            "days_idle": idle,
+            "category": category,
+            "action": "none",
+            "skip_reason": "",
         })
-        if n % progress_every == 0:
-            print(f"... scanned {n} users", file=sys.stderr)
     return rows
 
 
-def deactivate(client: OktaClient, rows: list):
-    for r in rows:
-        client.post(f"/api/v1/users/{r['user_id']}/lifecycle/deactivate")
-        r["action"] = "deactivated"
+def load_exclude_file(path: str | None) -> set[str]:
+    if not path:
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {line.strip().lower() for line in f
+                if line.strip() and not line.lstrip().startswith("#")}
 
 
-def print_table(rows: list):
-    print(f"{'LOGIN':40} {'NAME':28} {'LAST LOGIN':20} {'DAYS':>5} "
-          f"{'CATEGORY':15} ACTION")
-    print("-" * 140)
-    for r in rows:
-        print(f"{(r['login'] or '')[:40]:40} {(r['name'] or '')[:28]:28} "
-              f"{(r['last_login'] or 'never')[:20]:20} "
-              f"{r['days_dormant'] if r['days_dormant'] is not None else '?':>5} "
-              f"{r['category']:15} {r['action']}")
+def protected_accounts(client: OktaClient, exclude_groups: list[str]) -> dict[str, str]:
+    """user id -> reason it must never be swept."""
+    protected: dict[str, str] = {}
 
-
-def to_csv(rows: list) -> str:
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=[
-        "login", "name", "last_login", "days_dormant", "category", "action"])
-    w.writeheader()
-    for r in rows:
-        w.writerow({k: r[k] for k in w.fieldnames})
-    return buf.getvalue()
-
-
-def main():
-    p = argparse.ArgumentParser(
-        description="Find dormant ACTIVE users. DRY-RUN by default; "
-                    "deactivation requires BOTH --disable AND --confirm.")
-    p.add_argument("--days", type=int, default=90,
-                   help="inactivity threshold in days (default 90)")
-    p.add_argument("--disable", action="store_true",
-                   help="enable deactivation (requires --confirm too)")
-    p.add_argument("--confirm", action="store_true",
-                   help="second confirmation required for live deactivation")
-    p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    p.add_argument("--output", default=None,
-                   help="write report to file (.csv extension writes CSV)")
-    args = p.parse_args()
+    me = client.get_current_user()
+    if me:
+        protected[me["id"]] = "owns the API token this script is using"
 
     try:
-        client = OktaClient()
-    except OktaAuthError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+        for tok in client.list_api_tokens():
+            if tok.get("userId"):
+                protected.setdefault(tok["userId"], f"owns API token '{tok.get('name')}'")
+    except OktaForbiddenError:
+        print("warning: cannot list API tokens (needs super admin); only the "
+              "current token's owner is protected", file=sys.stderr)
 
-    rows = sweep(client, days=args.days)
+    try:
+        for uid in client.list_role_assignee_user_ids():
+            protected.setdefault(uid, "holds an admin role")
+    except OktaForbiddenError:
+        print("warning: cannot list admin role holders; admins are not "
+              "auto-excluded", file=sys.stderr)
 
-    live = args.disable and args.confirm
-    if live:
-        deactivate(client, rows)
-    elif args.disable and not args.confirm:
-        print("dry-run: --disable given without --confirm; no accounts touched",
-              file=sys.stderr)
+    for name in exclude_groups:
+        group = next((g for g in client.list_groups(name)
+                      if (g.get("profile") or {}).get("name") == name), None)
+        if group is None:
+            raise SystemExit(f"error: --exclude-group '{name}' not found")
+        for m in client.list_group_members(group["id"]):
+            protected.setdefault(m["id"], f"member of excluded group '{name}'")
+    return protected
 
+
+def apply_exclusions(rows: list[dict], protected: dict[str, str],
+                     excluded: set[str]) -> None:
     for r in rows:
-        del r["user_id"]
+        if r["user_id"] in protected:
+            r["skip_reason"] = protected[r["user_id"]]
+        elif (r["login"] or "").lower() in excluded or r["user_id"].lower() in excluded:
+            r["skip_reason"] = "listed in --exclude-file"
 
-    counts = {}
+
+def act(client: OktaClient, rows: list[dict], action: str, apply: bool,
+        limit: int) -> None:
+    """Suspend or deactivate the candidates, one at a time, recording each result."""
+    done = 0
     for r in rows:
-        counts[r["category"]] = counts.get(r["category"], 0) + 1
-    summary = {"threshold_days": args.days, "dry_run": not live,
-               "stale_users": len(rows), **counts}
+        if r["skip_reason"]:
+            r["action"] = "skipped"
+            continue
+        if limit and done >= limit:
+            r["action"] = "not processed (--limit reached)"
+            continue
+        done += 1
+        if not apply:
+            r["action"] = f"would {action}"
+            continue
+        try:
+            client.post(LIFECYCLE_PATH[action].format(id=r["user_id"]))
+            r["action"] = "suspended" if action == "suspend" else "deactivated"
+        except OktaError as e:
+            r["action"] = f"failed: {e}"
 
-    if args.json:
-        report = json.dumps({"summary": summary, "users": rows}, indent=2)
-    elif args.output and args.output.endswith(".csv"):
-        report = to_csv(rows)
-    else:
-        print_table(rows)
-        report_lines = [
-            "",
-            f"{'DRY RUN' if not live else 'LIVE'}: {summary['stale_users']} stale users | "
-            f"dormant: {counts.get('DORMANT', 0)} | "
-            f"never logged in: {counts.get('NEVER_LOGGED_IN', 0)}",
-        ]
-        report = "\n".join(report_lines)
 
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report if (args.json or args.output.endswith(".csv"))
-                    else report + "\n")
-        print(f"\nwrote {args.output}", file=sys.stderr)
-    elif not args.json:
-        print(report)
+def render(rows: list[dict], summary: dict) -> str:
+    body = table(
+        [("LOGIN", 38), ("LAST LOGIN", 20), ("DAYS", 5), ("CATEGORY", 15), ("ACTION", 0)],
+        [[r["login"], r["last_login"] or "never", r["days_idle"], r["category"],
+          r["action"] + (f" ({r['skip_reason']})" if r["skip_reason"] else "")]
+         for r in rows])
+    return (f"{body}\n\n{'APPLIED' if summary['applied'] else 'DRY RUN'}: "
+            f"{summary['stale_users']} stale, {summary['skipped']} protected, "
+            f"{summary['acted_or_would_act']} {summary['action']} candidates")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Find dormant Okta users; optionally "
+                                "suspend or deactivate them (dry run by default).")
+    p.add_argument("--days", type=int, default=90, help="idle threshold in days (default 90)")
+    p.add_argument("--action", choices=sorted(LIFECYCLE_PATH), default="suspend",
+                   help="what --apply does (default suspend, which is reversible)")
+    p.add_argument("--apply", action="store_true", help="make the changes")
+    p.add_argument("--limit", type=int, default=0,
+                   help="act on at most N accounts (0 = no cap)")
+    p.add_argument("--max", type=int, default=25,
+                   help="refuse to apply if more than N accounts would change (default 25)")
+    p.add_argument("--exclude-file", help="file of logins or user IDs to never touch, one per line")
+    p.add_argument("--exclude-group", action="append", default=[],
+                   help="group name whose members are never touched (repeatable)")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.add_argument("--output", help="write the report here (.csv for CSV)")
+    args = p.parse_args(argv)
+
+    client = connect()
+    rows = find_stale(client.list_users(status="ACTIVE"), args.days)
+    apply_exclusions(rows, protected_accounts(client, args.exclude_group),
+                     load_exclude_file(args.exclude_file))
+
+    candidates = [r for r in rows if not r["skip_reason"]]
+    to_change = min(len(candidates), args.limit) if args.limit else len(candidates)
+    if args.apply and to_change > args.max:
+        raise SystemExit(f"error: {to_change} accounts would be changed, above --max "
+                         f"{args.max}. Narrow it with --limit or raise --max.")
+
+    act(client, rows, args.action, args.apply, args.limit)
+
+    summary = {"threshold_days": args.days, "applied": args.apply,
+               "action": args.action, "stale_users": len(rows),
+               "skipped": len(rows) - len(candidates), "acted_or_would_act": to_change}
+    emit(report={"summary": summary, "users": rows}, text=render(rows, summary),
+         as_json=args.json, output=args.output, csv_rows=rows,
+         csv_fields=["login", "name", "last_login", "days_idle", "category",
+                     "action", "skip_reason"])
 
 
 if __name__ == "__main__":
