@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Verifies a terminated user's access is fully revoked in Okta.
@@ -6,21 +7,21 @@
     Given a user's login, runs seven read-only checks: account disabled,
     sessions revoked, app assignments removed, admin roles removed, MFA
     factors removed, group memberships cleared, and API tokens revoked.
-    Each check reports PASS/FAIL/WARN with evidence (IDs, timestamps), so
-    the report answers an auditor's "did it actually stick?" without
-    hand-built spreadsheets.
+    Each check reports PASS/FAIL/WARN with evidence (IDs, timestamps) that
+    can go straight into an offboarding ticket or audit sample.
 
-    WARN means the check could not be evaluated (an API call failed) --
+    WARN means the check could not be evaluated (an API call failed);
     it is neither a pass nor proof of a problem. The evidence always says
     what went wrong.
 
     Evidence notes worth knowing:
-      - SessionsRevoked queries the System Log for session-start events after
-        the account's statusChanged timestamp. Okta's /users/{id}/sessions
+      - SessionsRevoked queries the System Log for user.session.start events
+        where the user is the actor, after the account's statusChanged
+        timestamp. The System Log keeps 90 days. Okta's /users/{id}/sessions
         endpoint is DELETE-only (there is no read API listing live sessions),
         so the log is the evidence: a disabled account that still starts
         sessions FAILs this check.
-      - AppAssignmentsRemoved uses the user's appLinks -- the effective
+      - AppAssignmentsRemoved uses the user's appLinks; the effective
         list of apps they can still reach, whatever granted the access.
       - MfaFactorsRemoved FAILs only on ACTIVE factors. Okta
         lifecycle-deactivates factors on deprovision, so INACTIVE factors
@@ -28,11 +29,13 @@
       - GroupMembershipsCleared ignores the Everyone group. Okta retains
         deprovisioned users in Everyone; that membership is expected.
       - ApiTokensRevoked lists tenant tokens and matches on owner. The
-        endpoint (GET /api/v1/api-tokens) requires a SUPER-ADMIN API token --
+        endpoint (GET /api/v1/api-tokens) requires a SUPER-ADMIN API token;
         without one the check reports WARN instead of a false PASS.
 
-    READ-ONLY: every HTTP call is a GET. The script never changes anything
-    in the tenant.
+    Read-only: every call is a GET.
+
+    Not covered yet: OAuth grants and refresh tokens
+    (/api/v1/users/{userId}/grants), registered devices, and IdP links.
 
     Exit code is 0 when the verdict is COMPLETE, 1 when it is INCOMPLETE
     or the user cannot be found.
@@ -129,17 +132,16 @@ $check1Result = if ($statusOk) { 'PASS' } else { 'FAIL' }
 $checks += New-CheckResult -Name 'AccountDisabled' -Result $check1Result -Evidence `
     "status=$($user.status); statusChanged=$($user.statusChanged); lastLogin=$lastLogin"
 
-# 2. Sessions revoked. Okta's /users/{id}/sessions endpoint is DELETE-only --
-#    there is no GET to list live sessions -- so the System Log is the honest
-#    evidence: session-start events after the account was disabled mean
-#    sessions were NOT effectively revoked.
+# 2. Sessions revoked. /users/{id}/sessions is DELETE-only, so the System Log
+#    is the evidence: a sign-in after the account was disabled means sessions
+#    were not revoked. For user.session.start the user is the actor.
 $postDisableLogins = 0
 $logFailed = $false
 $logNote = ''
 try {
     if ($user.statusChanged) {
-        $filter = "eventType eq `"user.session.start`" and target.id eq `"$userId`""
-        $events = @(Get-OktaLogs -Client $client -Filter $filter -Since $user.statusChanged | Select-Object -First 6)
+        $filter = "eventType eq `"user.session.start`" and actor.id eq `"$userId`""
+        $events = @(Get-OktaLogs -Client $client -Filter $filter -Since (ConvertTo-OktaIsoString $user.statusChanged) | Select-Object -First 6)
         $postDisableLogins = $events.Count
         if ($events.Count -eq 0) {
             $logNote = '0 session-start events in the System Log since disabled'
@@ -201,7 +203,7 @@ try {
     })
     $evidence = Format-EvidenceItems -Items $items -Limit $Limit -EmptyText 'no enrolled factors'
     if ($factors.Count -gt 0 -and $active.Count -eq 0) {
-        $evidence += ' (all factors non-ACTIVE; Okta deactivates factors on deprovision -- expected)'
+        $evidence += ' (all factors non-ACTIVE; Okta deactivates factors on deprovision; expected)'
     }
     $checks += New-CheckResult -Name 'MfaFactorsRemoved' `
         -Result $(if ($active.Count -eq 0) { 'PASS' } else { 'FAIL' }) `
@@ -221,7 +223,7 @@ try {
     })
     $evidence = Format-EvidenceItems -Items $items -Limit $Limit -EmptyText 'no group memberships'
     if ($nonEveryone.Count -eq 0 -and $groups.Count -gt 0) {
-        $evidence += ' (Everyone membership is retained by Okta on deprovisioned users -- expected)'
+        $evidence += ' (Everyone membership is retained by Okta on deprovisioned users; expected)'
     }
     $checks += New-CheckResult -Name 'GroupMembershipsCleared' `
         -Result $(if ($nonEveryone.Count -eq 0) { 'PASS' } else { 'FAIL' }) `
@@ -237,7 +239,7 @@ try {
     $tokens = @(Invoke-OktaPagedGet -Client $client -Path '/api/v1/api-tokens' |
         Where-Object { $_.userId -eq $userId })
     $items = @($tokens | ForEach-Object {
-        "token '$($_.name)' [$($_.id)] created=$($_.created) lastUsed=$($_.lastUpdated) expires=$($_.expiresAt)"
+        "token '$($_.name)' [$($_.id)] created=$($_.created) lastUpdated=$($_.lastUpdated) expires=$($_.expiresAt)"
     })
     $checks += New-CheckResult -Name 'ApiTokensRevoked' `
         -Result $(if ($tokens.Count -eq 0) { 'PASS' } else { 'FAIL' }) `
@@ -274,9 +276,9 @@ if ($Json) {
     if ($payload) { Write-Output $payload }
     if ($Output) { $payload | Out-File -FilePath $Output -Encoding utf8 }
 } else {
-    Write-Output "Leaver verification: $($report.Login) [$($report.UserId)] status=$($report.UserStatus) -- verdict: $($report.Verdict) ($($report.Passed)/$($checks.Count) checks passed)"
-    $checks | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
-    if ($Output) { $checks | Export-Csv -Path $Output -NoTypeInformation -Encoding utf8 }
+    Write-Output "Leaver verification: $($report.Login) [$($report.UserId)] status=$($report.UserStatus), verdict: $($report.Verdict) ($($report.Passed)/$($checks.Count) checks passed)"
+    $checks | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Output
+    if ($Output) { $checks | Export-OktaCsv -Path $Output }
 }
 
 if ($verdict -eq 'COMPLETE') { exit 0 } else { exit 1 }
