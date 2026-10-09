@@ -1,7 +1,7 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Builds per-app access review CSV packs for manager certification, the
-    no-budget alternative to Okta Identity Governance.
+    Builds per-app access review CSV packs for a basic manager certification.
 
 .DESCRIPTION
     For every ACTIVE app in the tenant, exports its assignments to a CSV with
@@ -27,8 +27,14 @@
     source of orphaned access; direct assignments score per-row because they
     bypass group governance.
 
-    STRICTLY READ-ONLY: every HTTP call this script makes is GET. Nothing in
-    the tenant is created, modified, or deleted.
+    Read-only: every call is a GET.
+
+    LastLogin is the user's last Okta sign-in, not their last use of this
+    app. For per-app last use, check the Application Usage report or the
+    System Log (user.authentication.sso per app).
+
+    CSV cells that start with = + - @ are prefixed with a quote so a profile
+    field can't run as a formula when a reviewer opens the file in Excel.
 
 .PARAMETER OutputDir
     Directory the review pack is written to. Default:
@@ -172,7 +178,7 @@ foreach ($app in $apps) {
     $csvPath = Join-Path $OutputDir $fileName
     if ($rows.Count -gt 0) {
         $rows | Select-Object App, Login, Name, Manager, AssignmentType, LastLogin,
-            DaysInactive, ReviewFlag | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+            DaysInactive, ReviewFlag | Export-OktaCsv -Path $csvPath
     } else {
         'App,Login,Name,Manager,AssignmentType,LastLogin,DaysInactive,ReviewFlag' |
             Out-File -FilePath $csvPath -Encoding utf8
@@ -202,41 +208,41 @@ foreach ($app in $apps) {
 $summary = @($summary | Sort-Object -Property RiskScore -Descending)
 $summary | Select-Object App, Assignments, DirectCount, DormantCount,
     NeverLoggedIn, RiskScore, CsvFile |
-    Export-Csv -Path (Join-Path $OutputDir '_SUMMARY.csv') -NoTypeInformation -Encoding utf8
+    Export-OktaCsv -Path (Join-Path $OutputDir '_SUMMARY.csv')
 
 $guide = @'
 # Access Review Guide
 
 This folder is a review pack: one CSV per application listing who has access,
-plus a `_SUMMARY.csv` rollup. It replaces the manual export scramble and the
-paid Okta Identity Governance license for a basic quarterly certification.
-Everything here is read-only evidence -- generating it changed nothing.
+plus a `_SUMMARY.csv` rollup, for a basic quarterly access certification.
+Generating it changed nothing in Okta.
 
 ## The quarterly review cycle
 
 1. **Generate the pack.** Run `pwsh ./New-AccessReviewPack.ps1`. A new
    `review-packs-<date>/` folder appears with one CSV per app.
 2. **Start with the rollup.** Open `_SUMMARY.csv`. It is sorted by RiskScore,
-   so the riskiest apps are at the top. Assign each app's CSV to its owner --
+   so the riskiest apps are at the top. Assign each app's CSV to its owner;
    usually the app's business owner or the reporter's manager, not IT.
 3. **Review each CSV.** The reviewer goes row by row and marks each assignment
    APPROVE (keep access) or REVOKE (remove access), ideally in a copy of the
    CSV with an added "Decision" column.
 4. **Pay attention to the flags.** Rows with a `ReviewFlag` need a real
    decision, not a rubber stamp:
-   - `DORMANT` / `NEVER_LOGGED_IN` -- nobody has used this access. Default to
-     REVOKE unless the reviewer can name a reason to keep it.
-   - `DIRECT_ASSIGNMENT` -- the user was given access individually instead of
+   - `DORMANT` / `NEVER_LOGGED_IN`: the person hasn't signed in to Okta
+     recently (or ever). That is about Okta as a whole, not this app, but it
+     is a strong hint the access isn't needed. Ask before keeping it.
+   - `DIRECT_ASSIGNMENT`; the user was given access individually instead of
      through a group. Ask: should this be a group membership instead?
-   - `UNRESOLVED_USER` -- the assignment points at a user that no longer
+   - `UNRESOLVED_USER`; the assignment points at a user that no longer
      resolves. Almost always safe to REVOKE; treat it as cleanup.
-   - No flag -- routine access. Verify the person still needs the app, then
+   - No flag; routine access. Verify the person still needs the app, then
      APPROVE.
 5. **Record the outcome.** Keep the reviewed CSVs and the reviewer's decisions
    somewhere auditors can find them (a ticket, a shared drive, Confluence).
    That paper trail is what auditors actually ask for: who had access, who
    approved it, and when.
-6. **Act on revocations.** Removing access is a separate step -- do it through
+6. **Act on revocations.** Removing access is a separate step; do it through
    the normal deprovisioning process, not from this pack.
 
 Repeat quarterly. A good rhythm is one week per quarter: day 1 generate and
@@ -253,12 +259,12 @@ assign, days 2-4 reviews come back, day 5 record and close out.
 | AssignmentType | `Direct` = assigned to the user individually; `Group` = inherited from a group |
 | LastLogin | The user's most recent Okta login, or `never` |
 | DaysInactive | Days since last login (dormant accounts only) |
-| ReviewFlag | Attention flags, separated by `; ` -- blank means routine |
+| ReviewFlag | Attention flags, separated by `; ` (blank means routine) |
 
 ## About the RiskScore
 
 `RiskScore = DirectCount + 2 x DormantCount + 3 x NeverLoggedInCount`.
-Never-logged-in accounts score highest -- they are the most common source of
+Never-logged-in accounts score highest; they are the most common source of
 orphaned access. Direct assignments score per row because they bypass group
 governance. The score is a triage aid, not a verdict: an app can be risky for
 legitimate reasons, and a low score is not a clean bill of health.
@@ -270,5 +276,5 @@ if ($Json) {
     if ($payload) { Write-Output $payload }
 } else {
     $summary | Select-Object App, Assignments, DirectCount, DormantCount,
-        NeverLoggedIn, RiskScore | Format-Table -AutoSize | Out-String | Write-Output
+        NeverLoggedIn, RiskScore | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
 }
