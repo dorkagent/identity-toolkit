@@ -1,6 +1,6 @@
 # Identity Toolkit
 
-Practical, offline-first tooling for Okta administration and Okta → Microsoft Entra ID migration planning. every script solves one concrete problem, and everything runs against local fixtures before it ever touches a live tenant.
+Practical, offline-first tooling for Okta administration and Okta → Microsoft Entra ID migration planning. Every script solves one concrete problem, and everything runs against local fixtures before it ever touches a live tenant.
 
 ## What's inside
 
