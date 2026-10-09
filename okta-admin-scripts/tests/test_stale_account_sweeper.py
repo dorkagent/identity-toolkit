@@ -98,3 +98,16 @@ def test_without_token_listing_rights_it_still_protects_current_owner(monkeypatc
     by_login = {u["login"]: u for u in report["users"]}
     assert by_login["u1@x"]["skip_reason"].startswith("owns the API token")
     assert by_login["u2@x"]["action"] == "would suspend"
+
+
+def test_oauth_without_token_listing_warns_that_no_owner_is_protected(monkeypatch, fake, capsys):
+    # Live run (Oct 2026) as an OAuth service app: there is no /users/me owner, so the
+    # old "only the current token's owner is protected" warning was wrong.
+    org(fake, tokens_forbidden=True)
+    monkeypatch.setattr(OktaClient, "get_current_user", lambda self: None)
+    monkeypatch.setattr(sweeper, "connect",
+                        lambda: OktaClient(BASE, "t", session=fake, sleep=lambda s: None))
+    sweeper.main(["--json"])
+    err = capsys.readouterr().err
+    assert "no API token owners are protected" in err
+    assert "only the current token's owner" not in err
