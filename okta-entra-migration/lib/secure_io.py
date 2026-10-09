@@ -11,6 +11,9 @@ Every file this toolkit writes goes through here:
   (passwords, tokens, TAPs) before serialization. Secrets are shown once on
   stdout or written to an explicitly requested 0600 file -- never baked
   into reports.
+* **CSV cells can't become formulas** -- app labels and token names come
+  from Okta and end up in spreadsheets; a cell starting with = + - @ (or a
+  tab / carriage return) is prefixed with a quote.
 * ``-`` as a path means stdout (no literal file named ``-`` is created).
 """
 
@@ -92,12 +95,31 @@ def write_json(path: str | None, obj, scrub: bool = True,
                       mode)
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value):
+    """Neutralise spreadsheet formula injection in one CSV cell."""
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+class SafeDictWriter(csv.DictWriter):
+    def writerow(self, rowdict):
+        return super().writerow({k: csv_safe(v) for k, v in rowdict.items()})
+
+    def writerows(self, rowdicts):
+        for row in rowdicts:
+            self.writerow(row)
+
+
 @contextlib.contextmanager
 def csv_writer(path: str | None, fieldnames: list[str]):
     """Yield a csv.DictWriter; file output is atomic + 0600, ``-``/None = stdout."""
     if path is None or path == "-":
-        yield csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+        yield SafeDictWriter(sys.stdout, fieldnames=fieldnames)
         return
     buf = io.StringIO()
-    yield csv.DictWriter(buf, fieldnames=fieldnames)
+    yield SafeDictWriter(buf, fieldnames=fieldnames)
     atomic_write_text(path, buf.getvalue())

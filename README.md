@@ -8,13 +8,13 @@ Practical, offline-first tooling for Okta administration and Okta → Microsoft 
 Standalone PowerShell + Python scripts for the problems IAM teams hit every week: MFA coverage audits, sign-on policy linting, stale-account sweeps, license optimization, break-glass monitoring, admin privilege reviews, JML automation, app rationalization, tenant drift detection, and System Log threat detections. Each script ships in both languages and shares one client module, so auth, pagination, and rate-limiting are solved once. See [its README](okta-admin-scripts/README.md).
 
 ### `okta-entra-migration/` — Okta → Entra migration planning toolkit
-Free, offline-first toolkit: export a complete Okta tenant inventory and plan the move to Microsoft Entra ID. Covers user export/matching, group mirroring (including Okta dynamic-rule → Entra dynamic-membership translation), app-migration planning with an IdP/SP mapping handoff for app owners, service-account inventory, ImmutableID verification, and a per-app cutover tracker. See [its README](okta-entra-migration/README.md) for the full capability and maturity table.
+Offline-first scripts that export an Okta org into a JSON inventory and plan the move to Microsoft Entra ID. Covers user export/matching, group mirroring (including Okta dynamic-rule → Entra dynamic-membership translation), app-migration planning with an IdP/SP mapping handoff for app owners, service-account inventory, ImmutableID verification, and a per-app cutover tracker. See [its README](okta-entra-migration/README.md) for what each script does and how it has been tested.
 
 ## Honesty notes
 
-- The migration toolkit's `--apply` paths have unit tests and fixture-driven checks but have **never been run against a live tenant**. Treat them as reviewed-but-unproven until a lab tenant says otherwise.
+- The migration kit's `--apply` paths are tested against mocked Graph endpoints but have **never been run against a live Entra tenant**. Try them in a lab tenant first.
 - Applications are plan-only by design — the toolkit does not create Entra enterprise apps.
-- Every `--live` run prints the connected tenant/org and aborts on mismatch. Tokens come from environment variables; nothing here hardcodes a secret or asks you to paste one into a file.
+- Live runs print the connected tenant or org. Scripts that write to Entra need `--expect-tenant` and stop if the credentials belong to a different tenant. Tokens come from environment variables; nothing here hardcodes a secret or asks you to paste one into a file.
 
 ## About the author
 

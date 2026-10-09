@@ -1,4 +1,4 @@
-"""Unit tests: journal resume semantics + audit trail (P0-4, P0-7)."""
+"""Unit tests: journal resume semantics + audit trail."""
 
 import json
 import os

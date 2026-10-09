@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LIFE-50: Verify ImmutableID / source-anchor alignment.
+"""Check ImmutableID / source-anchor alignment before turning on sync.
 
 Before Microsoft Entra Connect (or Cloud Sync) is pointed at a tenant that
 already holds user objects -- cloud users created by import_users.py, or
@@ -9,7 +9,7 @@ creates a duplicate or fails to hard-match, and for federated domains the
 ImmutableID is also half of the SAML NameID claim. This script computes the
 expected value from the Okta inventory and compares it with Entra.
 
-Verified computation (not model folklore):
+How the expected value is computed:
   - Microsoft Learn: the SourceAnchor value "is the Base64 string
     representation of the mS-Ds-ConsistencyGUID attribute (or ObjectGUID
     depending on the configuration) from the on-premises Active Directory
@@ -22,7 +22,7 @@ Verified computation (not model folklore):
     .NET Guid.ToByteArray() serializes the GUID fields little-endian, which
     is exactly Python's uuid.UUID(...).bytes_le.
 
-Scope, honestly labeled:
+Limits:
   - GUID-form anchors only (objectGUID, ms-DS-ConsistencyGuid -- the
     documented cases). Non-GUID anchor values are flagged "bad-anchor" for
     manual verification; v1 does not guess their encoding.
@@ -31,7 +31,11 @@ Scope, honestly labeled:
     "objectGUID"). Point it at whatever your Okta AD-sourced profiles
     actually carry, and make sure it is the same attribute your Entra
     Connect uses as its sourceAnchor -- a mismatch there is itself a
-    finding this script cannot see.
+    finding this script cannot see. Okta's base user profile usually does
+    not carry objectGUID at all unless someone mapped it, in which case
+    every user comes back no-anchor.
+  - Matching is by UPN. Email is used only when exactly one non-guest
+    Entra user has that address, and the report says which one was used.
 
 Verdicts per user:
   match                      Entra onPremisesImmutableId == expected
@@ -42,6 +46,8 @@ Verdicts per user:
                              before enabling sync, or expect soft-match
                              behavior
   no-entra-user              not in Entra (not yet imported/synced)
+  ambiguous-email            no UPN match and several Entra users share
+                             the email
   no-anchor                  Okta profile lacks the anchor attribute
   bad-anchor                 anchor value is not GUID-form (v1 limitation)
 
@@ -55,15 +61,14 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import base64
+import json
 import os
-import re
 import sys
-import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "lib"))
 sys.path.insert(0, os.path.dirname(__file__))
 
+from anchors import GUID_RE, immutable_id_from_guid  # noqa: E402,F401
 from inventory import load_inventory  # noqa: E402
 from secure_io import write_json  # noqa: E402
 
@@ -71,22 +76,7 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 FIXTURE_INV = os.path.join(REPO, "fixtures", "okta-inventory.sample.json")
 FIXTURE_ENTRA = os.path.join(REPO, "fixtures", "entra-tenant.sample.json")
 
-GUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
 AD_PROVIDERS = {"ACTIVE_DIRECTORY", "LDAP"}
-
-
-def immutable_id_from_guid(guid_str: str) -> str:
-    """Expected Entra ImmutableID for a GUID-form source anchor.
-
-    Base64 of the GUID bytes in .NET Guid.ToByteArray() order
-    (little-endian fields == uuid.UUID.bytes_le). Raises ValueError for
-    non-GUID input.
-    """
-    return base64.b64encode(
-        uuid.UUID(guid_str.strip()).bytes_le).decode("ascii")
 
 
 def verify_users(okta_users: list[dict], entra_users: list[dict],
@@ -94,8 +84,14 @@ def verify_users(okta_users: list[dict], entra_users: list[dict],
     """Compare expected ImmutableIDs against Entra's onPremisesImmutableId."""
     by_upn = {str(u.get("userPrincipalName") or "").lower(): u
               for u in entra_users if u.get("userPrincipalName")}
-    by_mail = {str(u.get("mail") or "").lower(): u
-               for u in entra_users if u.get("mail")}
+    # Email is only a fallback, and only when exactly one non-guest Entra
+    # user carries it; several users sharing a mail is reported, not guessed.
+    by_mail: dict[str, list] = {}
+    for u in entra_users:
+        guest = (str(u.get("userType") or "").lower() == "guest"
+                 or "#ext#" in str(u.get("userPrincipalName") or "").lower())
+        if u.get("mail") and not guest:
+            by_mail.setdefault(str(u["mail"]).lower(), []).append(u)
     results: list[dict] = []
     skipped = 0
     for ou in okta_users:
@@ -121,9 +117,17 @@ def verify_users(okta_users: list[dict], entra_users: list[dict],
         else:
             expected = immutable_id_from_guid(str(anchor))
             rec["expectedImmutableId"] = expected
-            eu = (by_upn.get(login.lower())
-                  or by_mail.get(email.lower()))
-            if eu is None:
+            eu = by_upn.get(login.lower())
+            rec["matchedOn"] = "userPrincipalName" if eu else None
+            mail_hits = by_mail.get(email.lower(), []) if email else []
+            if eu is None and len(mail_hits) == 1:
+                eu = mail_hits[0]
+                rec["matchedOn"] = "mail"
+            if eu is None and len(mail_hits) > 1:
+                rec["verdict"] = "ambiguous-email"
+                rec["detail"] = (f"no UPN match and {len(mail_hits)} Entra "
+                                 f"users share {email!r}; resolve by hand")
+            elif eu is None:
                 rec["verdict"] = "no-entra-user"
                 rec["detail"] = ("no Entra user with this UPN/email; "
                                  "import or sync has not created it yet")
@@ -186,6 +190,9 @@ def parse_args(argv=None):
                         "Entra Connect uses as its sourceAnchor)")
     p.add_argument("--live", action="store_true",
                    help="compare against Microsoft Graph (read-only)")
+    p.add_argument("--expect-tenant", metavar="GUID",
+                   help="with --live: stop unless the credentials belong to "
+                        "this tenant id")
     p.add_argument("--entra-fixture",
                    help="local Entra user dump to compare against "
                         "(default: bundled fixture)")
@@ -198,26 +205,27 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def main(argv=None) -> int:
+def main(argv=None, graph_client=None) -> int:
     args = parse_args(argv)
     inv = load_inventory(args.inventory)
     if args.live:
-        from graph_api import GraphClient, TenantMismatchError  # noqa: E402
-        from tenant_guard import check_graph_tenant  # noqa: E402
+        from graph_api import GraphAuthError, GraphClient
+        from tenant_guard import check_graph_tenant
         try:
-            g = GraphClient.from_env()
-            org = check_graph_tenant(g)
-        except (TenantMismatchError, RuntimeError) as e:
+            g = graph_client or GraphClient()
+        except GraphAuthError as e:
             print(f"error: {e}", file=sys.stderr)
+            return 2
+        org = check_graph_tenant(g, lambda m: None, args.expect_tenant)
+        if org is None:
             return 2
         if not args.quiet:
             print(f"connected to tenant {org.get('displayName') or '?'} "
                   f"({org.get('id') or '?'}) -- read-only check")
-        entra_users = g.list_user_anchors()
+        entra_users = list(g.list_user_anchors())
     else:
-        import json  # noqa: E402
         path = args.entra_fixture or FIXTURE_ENTRA
-        with open(path) as fh:
+        with open(path, encoding="utf-8") as fh:
             entra_users = json.load(fh)["users"]
     report = verify_users(inv["users"], entra_users, args.anchor_attr,
                           ad_only=not args.all_users)

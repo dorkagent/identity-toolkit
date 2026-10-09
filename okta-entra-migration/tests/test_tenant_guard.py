@@ -1,4 +1,4 @@
-"""Unit tests: wrong-tenant protection + apply confirmation (P0-7)."""
+"""Unit tests: wrong-tenant protection + apply confirmation."""
 
 import unittest
 

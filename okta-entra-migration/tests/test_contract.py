@@ -1,4 +1,4 @@
-"""Contract tests: inventory schema + fixture files (P0-8).
+"""Contract tests: inventory schema + fixture files.
 
 These pin the inventory contract that every downstream script relies on.
 If the contract changes, these tests fail first -- update them and every
@@ -42,7 +42,7 @@ class FixtureFilesTest(unittest.TestCase):
                           f"user {u.get('id')} missing credentials.provider.type")
 
     def test_fixture_covers_ad_mastered_user(self):
-        # The AD-mastered guard (P0-6) is only meaningful if a fixture
+        # The AD-mastered guard is only meaningful if a fixture
         # exercises it.
         raw = json.load(open(os.path.join(FIXTURES, "okta-raw.sample.json")))
         types = {(u.get("credentials") or {}).get("provider", {}).get("type")

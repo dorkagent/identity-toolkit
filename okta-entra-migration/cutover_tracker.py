@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LIFE-44: Track per-app cutover status with app owners.
+"""Track per-app cutover status with app owners.
 
 Generates a tracker CSV from the inventory contract (or from the mapping
 table produced by migrate_apps.py) -- one row per app:
@@ -82,8 +82,6 @@ def outstanding_report(rows: list[dict]) -> str:
         for r in by_status.get(status, []):
             owner = f" (owner: {r['owner']})" if r["owner"] else " (owner: UNASSIGNED)"
             lines.append(f"  [{status}] {r['app_name']}{owner}")
-    if not any(not r["owner"] for r in open_rows):
-        pass
     unowned = [r["app_name"] for r in open_rows if not r["owner"]]
     if unowned:
         lines.append("apps with no owner assigned: " + ", ".join(unowned))

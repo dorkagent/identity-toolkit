@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""LIFE-48: Inventory service accounts and API integrations.
+"""List service accounts and API integrations that need a new home in Entra.
 
 Default (offline) mode scans the inventory contract and emits a checklist
-CSV proving every non-human credential is accounted for:
+CSV of every non-human credential the export found:
 
   * Okta API tokens (inventory "apiTokens")
   * OAuth/OIDC service apps (inventory "oauthApps")
   * service-account users (userType SERVICE or login starting with svc_)
 
 Each item gets a migration note; the checklist ends with a coverage summary
-so nothing slips through unaccounted.
+that confirms the export is internally consistent.
 
 CSV columns:
     kind, id, name, detail, created, last_updated, expires_at,
@@ -99,7 +99,8 @@ def collect(inv: dict) -> list[dict]:
 
 
 def coverage_check(inv: dict, rows: list[dict]) -> list[str]:
-    """Cross-check that the export left nothing unaccounted for."""
+    """Check the export is consistent with itself (token owners exist,
+    every OIDC app is listed). This can't find things the export missed."""
     problems = []
     # Every oauthApp id must be a real app in the inventory.
     app_ids = {a["id"] for a in inv.get("apps", [])}
@@ -155,7 +156,8 @@ def main(argv=None) -> int:
             for pr in problems:
                 print(f"  !! {pr}")
         else:
-            print("coverage: nothing unaccounted for")
+            print("cross-check: every token owner and OIDC app is in the export "
+                  "(this checks the export against itself, not against Okta)")
     return 1 if problems else 0
 
 

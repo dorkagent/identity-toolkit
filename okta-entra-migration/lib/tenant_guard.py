@@ -1,21 +1,32 @@
-"""Wrong-tenant protection and --apply confirmation, shared by --live scripts.
+"""Wrong-tenant protection and the --apply confirmation, shared by --live scripts.
 
-Every live run prints the connected tenant/org *before* doing anything, and
-aborts cleanly (exit 2, no traceback) if the connected tenant is not the
-configured one. Mutating runs (--apply) additionally require the operator
-to type APPLY, unless --yes is given for automation.
+What actually protects you here is ``--expect-tenant``: the operator states
+which Entra tenant (by GUID) the run is meant for, and the run stops if the
+credentials in the environment belong to a different one. Without it, the
+only check is that /organization agrees with GRAPH_TENANT_ID, which is the
+tenant the token was minted for anyway. Scripts that write to Entra require
+``--expect-tenant`` for ``--apply``.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 
+GUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-def check_graph_tenant(gc, log=print) -> dict:
-    """Verify the Graph client is talking to the configured tenant.
 
-    Prints the connected tenant and returns its /organization record.
-    Returns None and prints an error if the tenant mismatches.
+def is_guid(value: str | None) -> bool:
+    return bool(value) and bool(GUID_RE.match(value.strip()))
+
+
+def check_graph_tenant(gc, log=print, expect_tenant: str | None = None):
+    """Verify the Graph client is talking to the tenant the operator expects.
+
+    Prints the connected tenant and returns its /organization record, or
+    prints an error and returns None on any mismatch.
     """
     from graph_api import TenantMismatchError
     try:
@@ -23,29 +34,42 @@ def check_graph_tenant(gc, log=print) -> dict:
     except TenantMismatchError as e:
         print(f"error: {e}", file=sys.stderr)
         return None
+    actual = (org.get("id") or "").lower()
+    if expect_tenant is not None:
+        if not is_guid(expect_tenant):
+            print(f"error: --expect-tenant must be the tenant GUID, got "
+                  f"{expect_tenant!r}", file=sys.stderr)
+            return None
+        if actual != expect_tenant.strip().lower():
+            print(f"error: connected Entra tenant {actual or '?'} "
+                  f"({org.get('displayName') or '?'}) is not the expected "
+                  f"tenant {expect_tenant}. Refusing to continue.",
+                  file=sys.stderr)
+            return None
     log(f"connected Entra tenant: {org.get('displayName') or '?'} "
         f"({org.get('id') or '?'})")
     return org
 
 
-def check_okta_org(client, log=print) -> dict:
-    """Verify the Okta client is talking to the configured org domain."""
+def check_okta_org(client, log=print):
+    """Verify the Okta client is talking to the configured org."""
     from okta_api import OrgMismatchError
     try:
         org = client.verify_org()
     except OrgMismatchError as e:
         print(f"error: {e}", file=sys.stderr)
         return None
-    log(f"connected Okta org: {(org.get('subdomain') or '?')}.okta.com")
+    log(f"connected Okta org: {org.get('subdomain') or '?'} "
+        f"(id {org.get('id') or '?'})")
     return org
 
 
 def confirm_apply(summary: str, yes: bool) -> bool:
     """Ask the operator to type APPLY before a mutating run.
 
-    Returns True when confirmed (or --yes). Refuses -- without prompting --
-    when stdin is not a TTY and --yes was not given, so automation cannot
-    accidentally hang waiting for input.
+    Returns True when confirmed (or --yes). Refuses, without prompting,
+    when stdin is not a TTY and --yes was not given, so automation can't
+    hang waiting for input.
     """
     if yes:
         return True
