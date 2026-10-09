@@ -1,11 +1,17 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Generates a dependency-ordered, human-reviewed restore plan from an Okta config backup (WhatIf only).
 
 .DESCRIPTION
-    OFFLINE. Reads a JSON config backup file and produces a dependency-ordered
+    Nothing in this repo produces the backup format below yet; export it
+    yourself or adapt the loader. The plan also does not remap IDs, and
+    recreated objects get new IDs, so references between policies, rules
+    and assignments need fixing by hand after a restore.
+
+    Offline. Reads a JSON config backup file and produces a dependency-ordered
     restore plan: groups, then zones and authenticators, then policies and
-    rules, then apps, then assignments. The plan is WhatIf output -- the script
+    rules, then apps, then assignments. The plan is WhatIf output; the script
     applies nothing and makes zero HTTP calls to the Okta tenant.
 
     The shared OktaClient module is imported for repo consistency only; no
@@ -22,7 +28,7 @@
 
     Resources the plan cannot handle (unknown top-level keys, entries with
     neither name nor id) are collected into an "Unsupported" section that is
-    always printed -- never silently skipped.
+    always printed; never silently skipped.
 
     ACCEPTED BACKUP FORMAT (a JSON object; every top-level key is optional,
     missing keys are tolerated and their phase is emitted empty and noted):
@@ -261,7 +267,7 @@ function Add-ResourceStep {
     $name = Get-EntryName -Entry $Entry
     $id = Get-EntryId -Entry $Entry
     if (-not $name -and -not $id) {
-        Add-Unsupported -Source $Section -Detail "$Ref`: entry has neither name nor id -- skipped"
+        Add-Unsupported -Source $Section -Detail "$Ref`: entry has neither name nor id; skipped"
         return $null
     }
     $removal = Test-RemovalMarker -Entry $Entry
@@ -271,7 +277,7 @@ function Add-ResourceStep {
     if ($removal) {
         $action = $removal
         $needsApproval = $true
-        $removalReason = "marked for $removal in the backup -- confirm intent before restoring"
+        $removalReason = "marked for $removal in the backup; confirm intent before restoring"
         if ($reason) { $reason = "$removalReason; $reason" } else { $reason = $removalReason }
     }
     return (New-PlanStep -Phase $Phase -Action $action -Target (Get-DisplayTarget -Entry $Entry) -DependsOn $DependsOn -NeedsApproval $needsApproval -ApprovalReason $reason -Note $Note)
@@ -291,7 +297,7 @@ function Get-SectionEntries {
     $value = $backup.$Key
     if ($null -eq $value) { return @() }
     if ($value -is [string] -or $value -isnot [System.Collections.IEnumerable]) {
-        Add-Unsupported -Source $Key -Detail "expected an array of entries, got a scalar value -- skipped"
+        Add-Unsupported -Source $Key -Detail "expected an array of entries, got a scalar value; skipped"
         return @()
     }
     return @($value)
@@ -342,7 +348,7 @@ foreach ($key in $presentKeys) {
     if ($value -is [System.Collections.IEnumerable] -and $value -isnot [string]) {
         $shape = "$((@($value)).Count) entries"
     }
-    Add-Unsupported -Source $key -Detail "unknown top-level key '$key' ($shape) -- not understood; not planned"
+    Add-Unsupported -Source $key -Detail "unknown top-level key '$key' ($shape); not understood; not planned"
 }
 
 # ---- Phase 1: Groups --------------------------------------------------------
@@ -377,7 +383,7 @@ foreach ($entry in (Get-SectionEntries -Key 'zones')) {
 $index = 0
 foreach ($entry in (Get-SectionEntries -Key 'authenticators')) {
     $index++
-    $null = Add-ResourceStep -Section 'authenticators' -Phase 'ZonesAndAuthenticators' -Entry $entry -Ref "authenticators[$index]" -AlwaysApprove $true -AlwaysApproveReason 'authenticator changes alter MFA enrollment and sign-in security posture -- review before applying' -Note 'Authenticators restore in phase 2, before the policies that may require them.'
+    $null = Add-ResourceStep -Section 'authenticators' -Phase 'ZonesAndAuthenticators' -Entry $entry -Ref "authenticators[$index]" -AlwaysApprove $true -AlwaysApproveReason 'authenticator changes alter MFA enrollment and sign-in security posture; review before applying' -Note 'Authenticators restore in phase 2, before the policies that may require them.'
 }
 
 function Get-ReferencedSteps {
@@ -406,7 +412,7 @@ foreach ($policy in (Get-SectionEntries -Key 'policies')) {
     if ($policyJson) { $refSteps = Get-ReferencedSteps -JsonText $policyJson }
     $depNote = 'Phase order already restores groups and zones first; no direct group/zone references detected in this policy.'
     if ($refSteps.Count -gt 0) {
-        $depNote = "References groups/zones restored in step(s) $($refSteps -join ', ') -- restore those first."
+        $depNote = "References groups/zones restored in step(s) $($refSteps -join ', '); restore those first."
     }
     $policyStep = Add-ResourceStep -Section 'policies' -Phase 'PoliciesAndRules' -Entry $policy -Ref "policies[$index]" -DependsOn $refSteps -Note $depNote
     if ($null -eq $policyStep) { continue }
@@ -417,7 +423,7 @@ foreach ($policy in (Get-SectionEntries -Key 'policies')) {
         if ($policy.rules -is [System.Collections.IEnumerable] -and $policy.rules -isnot [string]) {
             $rules = @($policy.rules)
         } else {
-            Add-Unsupported -Source 'policies' -Detail "policies[$index]: 'rules' is not an array -- skipped"
+            Add-Unsupported -Source 'policies' -Detail "policies[$index]: 'rules' is not an array; skipped"
         }
     }
     $ruleIndex = 0
@@ -468,7 +474,7 @@ $index = 0
 foreach ($assignment in (Get-SectionEntries -Key 'assignments')) {
     $index++
     if ($assignment -isnot [pscustomobject]) {
-        Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: not an object -- skipped"
+        Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: not an object; skipped"
         continue
     }
     $appId = ''
@@ -490,13 +496,13 @@ foreach ($assignment in (Get-SectionEntries -Key 'assignments')) {
     $users = Get-EntryList -Entry $assignment -Keys @('userIds', 'users', 'logins', 'userLogins')
     $assignGroups = Get-EntryList -Entry $assignment -Keys @('groupIds', 'groups', 'groupNames')
     if ($users.Count -eq 0 -and $assignGroups.Count -eq 0) {
-        Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: no userIds/logins/groupIds/groups -- nothing to assign"
+        Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: no userIds/logins/groupIds/groups; nothing to assign"
         continue
     }
     foreach ($u in $users) {
         $userLabel = Get-PrincipalLabel -Ref $u
         if (-not $userLabel) {
-            Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: a user reference has no usable id or login -- skipped"
+            Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: a user reference has no usable id or login; skipped"
             continue
         }
         $deps = @()
@@ -505,20 +511,20 @@ foreach ($assignment in (Get-SectionEntries -Key 'assignments')) {
             $deps += $appStep
             $note += " Restore the app first (step $appStep)."
         } else {
-            $note += ' App not found in backup -- verify it exists in the tenant before assigning.'
+            $note += ' App not found in backup; verify it exists in the tenant before assigning.'
         }
         $needsApproval = $false
         $reason = ''
         if ($appIsRemoved) {
             $needsApproval = $true
-            $reason = "references app '$appTarget', which is marked for deletion/deactivation in the backup -- confirm intent"
+            $reason = "references app '$appTarget', which is marked for deletion/deactivation in the backup; confirm intent"
         }
         $null = New-PlanStep -Phase 'Assignments' -Action 'Assign' -Target "User '$userLabel' -> app '$appTarget'" -DependsOn $deps -NeedsApproval $needsApproval -ApprovalReason $reason -Note $note
     }
     foreach ($g in $assignGroups) {
         $groupLabel = Get-PrincipalLabel -Ref $g
         if (-not $groupLabel) {
-            Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: a group reference has no usable id or name -- skipped"
+            Add-Unsupported -Source 'assignments' -Detail "assignments[$index]: a group reference has no usable id or name; skipped"
             continue
         }
         $groupStep = Resolve-GroupStep -Ref $g
@@ -532,13 +538,13 @@ foreach ($assignment in (Get-SectionEntries -Key 'assignments')) {
         if ($missing.Count -eq 0) {
             $note += " Restore the app (step $appStep) and the group (step $groupStep) first."
         } else {
-            $note += " Not in backup ($($missing -join ' and ')) -- verify it exists in the tenant before assigning."
+            $note += " Not in backup ($($missing -join ' and ')); verify it exists in the tenant before assigning."
         }
         $needsApproval = $false
         $reason = ''
         if ($appIsRemoved) {
             $needsApproval = $true
-            $reason = "references app '$appTarget', which is marked for deletion/deactivation in the backup -- confirm intent"
+            $reason = "references app '$appTarget', which is marked for deletion/deactivation in the backup; confirm intent"
         }
         $null = New-PlanStep -Phase 'Assignments' -Action 'Assign' -Target "Group '$groupTarget' -> app '$appTarget'" -DependsOn $deps -NeedsApproval $needsApproval -ApprovalReason $reason -Note $note
     }
@@ -568,7 +574,7 @@ if ($Json) {
     $text = $plan | ConvertTo-Json -Depth 10
 } else {
     $lines = @()
-    $lines += '# Okta Config Restore Plan (WhatIf -- applies nothing)'
+    $lines += '# Okta Config Restore Plan (WhatIf: applies nothing)'
     $lines += ''
     $lines += "- Source backup: ``$BackupPath``"
     $lines += "- Generated (UTC): $($plan.generatedUtc)"
@@ -578,7 +584,7 @@ if ($Json) {
     $lines += '> zero HTTP calls and changes nothing in the tenant. A human reviews every step'
     $lines += '> below and applies it by hand (or not).'
     $lines += ''
-    $lines += "## REQUIRES HUMAN APPROVAL -- DO NOT APPLY WITHOUT REVIEW ($($approvalSteps.Count))"
+    $lines += "## Needs human approval before applying ($($approvalSteps.Count))"
     $lines += ''
     if ($approvalSteps.Count -eq 0) {
         $lines += 'None. No destructive or irreversible steps were detected.'
@@ -591,11 +597,11 @@ if ($Json) {
     }
     $lines += ''
     $phaseMeta = @(
-        @{ Key = 'Groups'; Title = 'Phase 1 -- Groups'; Sections = @('groups') },
-        @{ Key = 'ZonesAndAuthenticators'; Title = 'Phase 2 -- Zones and Authenticators'; Sections = @('zones', 'authenticators') },
-        @{ Key = 'PoliciesAndRules'; Title = 'Phase 3 -- Policies and Rules'; Sections = @('policies') },
-        @{ Key = 'Apps'; Title = 'Phase 4 -- Apps'; Sections = @('apps') },
-        @{ Key = 'Assignments'; Title = 'Phase 5 -- Assignments'; Sections = @('assignments') }
+        @{ Key = 'Groups'; Title = 'Phase 1: Groups'; Sections = @('groups') },
+        @{ Key = 'ZonesAndAuthenticators'; Title = 'Phase 2: Zones and Authenticators'; Sections = @('zones', 'authenticators') },
+        @{ Key = 'PoliciesAndRules'; Title = 'Phase 3: Policies and Rules'; Sections = @('policies') },
+        @{ Key = 'Apps'; Title = 'Phase 4: Apps'; Sections = @('apps') },
+        @{ Key = 'Assignments'; Title = 'Phase 5: Assignments'; Sections = @('assignments') }
     )
     foreach ($pm in $phaseMeta) {
         $phaseSteps = @($script:Steps | Where-Object { $_.Phase -eq $pm.Key })
@@ -604,9 +610,9 @@ if ($Json) {
         if ($phaseSteps.Count -eq 0) {
             $missingHere = @($pm.Sections | Where-Object { $script:MissingSections -contains $_ })
             if ($missingHere.Count -eq $pm.Sections.Count) {
-                $lines += 'No entries in backup -- phase skipped (tolerated).'
+                $lines += 'No entries in backup; phase skipped (tolerated).'
             } else {
-                $lines += 'No plannable entries -- see the Unsupported section.'
+                $lines += 'No plannable entries; see the Unsupported section.'
             }
         } else {
             $lines += '| Step | Action | Target | Depends on | Needs approval | Note |'
@@ -619,7 +625,7 @@ if ($Json) {
         }
         $lines += ''
     }
-    $lines += "## Unsupported -- reported, never skipped ($($script:Unsupported.Count))"
+    $lines += "## Unsupported (reported, not skipped) ($($script:Unsupported.Count))"
     $lines += ''
     if ($script:Unsupported.Count -eq 0) {
         $lines += 'None. Every top-level key and entry was understood.'
