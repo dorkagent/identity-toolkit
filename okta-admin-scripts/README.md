@@ -48,7 +48,9 @@ export OKTA_KEY_ID=...        # only if the app has more than one key
 
 The scripts sign a short-lived `private_key_jwt` assertion and use the
 client-credentials grant. DPoP-bound tokens aren't supported, so leave
-"Require DPoP" off on the app.
+"Require DPoP" off on the app. Both languages have been run this way against
+a real Okta org (Oct 2026), including the JML and sweeper write paths, with a
+service app holding a custom admin role scoped to a few groups.
 
 **SSWS API token.** Simpler, but the token carries the full admin role of
 whoever created it. For the reports, create it while signed in as a
@@ -126,6 +128,9 @@ so a user-editable profile field can't run as a spreadsheet formula.
 `jml_automation_kit.py` / `JML-AutomationKit.ps1`
 
 - Report only unless `--apply`.
+- New users are created in their OKTA_GROUP groups in the same call
+  (`groupIds`). An admin whose role is scoped to groups can only create users
+  that way; adding the groups afterwards gets HTTP 403 for them.
 - Profile updates are partial (`POST /api/v1/users/{id}`), so attributes not
   in the CSV are left alone.
 - `--prune` only removes OKTA_GROUP memberships and direct app assignments,
