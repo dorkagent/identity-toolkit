@@ -233,10 +233,19 @@ foreach ($r in $rows) {
         switch ($Mode) {
             'joiner' {
                 if (-not $user) {
-                    $created = Invoke-Change $login 'create_user' 'create user (staged, activate=false)' 'POST' `
-                        '/api/v1/users?activate=false' @{ profile = (Get-DesiredProfile $r) }
+                    # Put the user in their OKTA_GROUP groups in the create call (groupIds).
+                    # An admin whose role is scoped to groups may only create users inside
+                    # those groups: a create without groupIds gets HTTP 403 for them.
+                    $atCreate = @($groups | Where-Object { $g = Find-Group $_; $g -and $g.type -eq 'OKTA_GROUP' })
+                    $body = @{ profile = (Get-DesiredProfile $r) }
+                    $detail = 'create user (staged, activate=false)'
+                    if ($atCreate.Count) {
+                        $body.groupIds = @($atCreate | ForEach-Object { [string](Find-Group $_).id })
+                        $detail += ' in ' + ($atCreate -join ', ')
+                    }
+                    $created = Invoke-Change $login 'create_user' $detail 'POST' '/api/v1/users?activate=false' $body
                     $uid = if ($created) { [string]$created.id } else { $null }
-                    Add-Groups $login $uid $groups @{}
+                    Add-Groups $login $uid @($groups | Where-Object { $atCreate -notcontains $_ }) @{}
                     Add-Apps $login $uid $apps @{}
                 } else {
                     Sync-Profile $user $r
