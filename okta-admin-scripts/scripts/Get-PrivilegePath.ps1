@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Maps every privilege path to Okta admin roles: direct, via group, via group rule.
@@ -7,7 +8,9 @@
     path types are reported:
 
       Direct   - the role is assigned straight to the user
-                 (GET /api/v1/users/{id}/roles). Via shows '(direct grant)'.
+                 (GET /api/v1/users/{id}/roles, entries with
+                 assignmentType USER; GROUP entries there are inherited and
+                 come from the group pass instead). Via shows '(direct grant)'.
       ViaGroup - the user inherits the role through group membership. Via
                  names the group (GET /api/v1/groups/{id}/roles plus
                  GET /api/v1/groups/{id}/users).
@@ -18,10 +21,13 @@
 
     Dormant: users whose lastLogin is older than -DormantDays, or who never
     logged in, get Dormant = 'yes'. A per-user rollup follows the path table
-    so accounts with several stacked paths are impossible to miss.
+    and counts how many separate paths each account has.
 
-    STRICTLY READ-ONLY: every HTTP call is a GET. Nothing in the tenant is
-    created, changed, or deleted.
+    Read-only: every call is a GET.
+
+    Custom roles show as CUSTOM:<label>. Their resource sets are not
+    resolved yet, so a CUSTOM row says the user holds that role but not what
+    it can touch.
 
     Performance: direct grants cost one /roles call per user, so big tenants
     are slow. Use -Limit for a trial run over N users first.
@@ -50,7 +56,7 @@
 
 .EXAMPLE
     pwsh ./Get-PrivilegePath.ps1
-    Full privilege-path map for every ACTIVE user, scariest rows first.
+    Privilege-path map for every ACTIVE user, dormant and highest roles first.
 
 .EXAMPLE
     pwsh ./Get-PrivilegePath.ps1 -DormantDays 30 -Limit 25
@@ -82,12 +88,17 @@ function Get-RoleRank {
         'USER_ADMIN'                  { return 4 }
         'HELP_DESK_ADMIN'             { return 5 }
         'GROUP_MEMBERSHIP_ADMIN'      { return 6 }
-        'GROUP_ADMIN'                 { return 7 }
-        'MOBILE_ADMIN'                { return 8 }
-        'API_ACCESS_MANAGEMENT_ADMIN' { return 9 }
-        'READ_ONLY_ADMIN'             { return 10 }
-        'REPORT_ADMIN'                { return 11 }
-        default                       { return 50 }
+        'API_ACCESS_MANAGEMENT_ADMIN' { return 7 }
+        'WORKFLOWS_ADMIN'             { return 8 }
+        'ACCESS_REQUESTS_ADMIN'       { return 9 }
+        'ACCESS_CERTIFICATIONS_ADMIN' { return 10 }
+        'READ_ONLY_ADMIN'             { return 11 }
+        'REPORT_ADMIN'                { return 12 }
+        default {
+            # Custom roles can carry anything; rank them with the high ones until resource sets are resolved.
+            if ($Type -like 'CUSTOM*') { return 3 }
+            return 50
+        }
     }
 }
 
@@ -104,7 +115,7 @@ function Get-DormantState {
     $lastLoginRaw = $User.lastLogin
     $neverLoggedIn = ($null -eq $lastLoginRaw) -or ('' -eq "$lastLoginRaw")
     if ($neverLoggedIn) { return 'NEVER_LOGGED_IN' }
-    if ([datetime]$lastLoginRaw -lt $Cutoff) { return 'DORMANT' }
+    if ((ConvertTo-OktaUtcDate $lastLoginRaw) -lt $Cutoff) { return 'DORMANT' }
     return 'ACTIVE'
 }
 
@@ -135,6 +146,7 @@ function New-PathRow {
     if (-not $info) { return $null }
     $roleType = 'UNKNOWN'
     if ($Role -and $Role.type) { $roleType = [string]$Role.type }
+    if ($roleType -eq 'CUSTOM') { $roleType = "CUSTOM:$($Role.label)" }
     $flags = @()
     switch ($PathType) {
         'Direct'   { $flags += 'DIRECT_GRANT' }
@@ -173,7 +185,7 @@ foreach ($u in $users) {
         $warnings += "direct roles for user $uid skipped: $($_.Exception.Message)"
         continue
     }
-    foreach ($r in $directRoles) {
+    foreach ($r in @($directRoles | Where-Object { $_.assignmentType -ne 'GROUP' })) {
         $row = New-PathRow -UserId $uid -PathType 'Direct' -Via '(direct grant)' -Role $r
         if ($row) { $rows += $row }
     }
@@ -247,7 +259,7 @@ foreach ($rule in $rules) {
     }
 }
 
-# Scariest first: dormant, then role severity, then path type, then user.
+# Sort: dormant first, then role rank, then path type, then user.
 $byScary = @(
     @{ Expression = { if ($_.Dormant -eq 'yes') { 0 } else { 1 } } }
     @{ Expression = { Get-RoleRank -Type ([string]$_.Role) } }
@@ -257,7 +269,7 @@ $byScary = @(
 )
 $rows = @($rows | Sort-Object -Property $byScary)
 
-# Per-user rollup: stacked paths on one account are impossible to miss.
+# Per-user rollup: how many separate paths each account has.
 $byRollup = @(
     @{ Expression = { if ($_.Dormant -eq 'yes') { 0 } else { 1 } } }
     @{ Expression = { $_.Paths }; Descending = $true }
@@ -308,14 +320,13 @@ if ($Json) {
     if ($rows.Count -eq 0) {
         Write-Output 'No admin role assignments found in scope.'
     } else {
-        $rows | Format-Table -AutoSize
-        Write-Output ''
-        Write-Output 'Per-user rollup - stacked paths on one account are the escalation to review first:'
-        $rollup | Format-Table -AutoSize
+        $rows | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Output
+        Write-Output 'Per-user rollup (accounts with several paths are worth reviewing first):'
+        $rollup | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
     }
     if ($Output) {
         if ($rows.Count -gt 0) {
-            $rows | Export-Csv -Path $Output -NoTypeInformation -Encoding utf8
+            $rows | Export-OktaCsv -Path $Output
         } else {
             Write-Output 'No privilege paths found; no CSV written.'
         }
