@@ -12,10 +12,12 @@
       "department": "Engineering",
       "title": "Staff Engineer",
       "manager": "grace.hopper@example.com",
+      "countryCode": null,
       "groups": [
         "00gAAA11111111111",
         "00gBBB22222222222",
-        "00gCCC33333333333"
+        "00gCCC33333333333",
+        "00gFFF66666666666"
       ],
       "apps": [
         "0oaAAA11111111111",
@@ -43,9 +45,11 @@
       "department": "Engineering",
       "title": "Engineer II",
       "manager": null,
+      "countryCode": null,
       "groups": [
         "00gAAA11111111111",
-        "00gCCC33333333333"
+        "00gCCC33333333333",
+        "00gFFF66666666666"
       ],
       "apps": [
         "0oaAAA11111111111"
@@ -56,8 +60,8 @@
         "firstName": "Alan",
         "lastName": "Turing",
         "login": "alan.turing@example.com",
-        "title": "Engineer II",
-        "objectGUID": "6F8B3A2C-1D4E-4F5A-8B7C-9D0E1F2A3B4C"
+        "objectGUID": "6F8B3A2C-1D4E-4F5A-8B7C-9D0E1F2A3B4C",
+        "title": "Engineer II"
       }
     },
     {
@@ -72,8 +76,10 @@
       "department": null,
       "title": null,
       "manager": null,
+      "countryCode": null,
       "groups": [
-        "00gCCC33333333333"
+        "00gCCC33333333333",
+        "00gFFF66666666666"
       ],
       "apps": [],
       "profile": {
@@ -96,6 +102,7 @@
       "department": null,
       "title": null,
       "manager": null,
+      "countryCode": null,
       "groups": [],
       "apps": [],
       "profile": {
@@ -103,6 +110,115 @@
         "firstName": "Katherine",
         "lastName": "Johnson",
         "login": "katherine.johnson@example.com"
+      }
+    },
+    {
+      "id": "00uEEE55555555555",
+      "login": "o.brien+test@example.com",
+      "email": "o.brien@example.com",
+      "firstName": "Siobhan",
+      "lastName": "O'Brien",
+      "status": "ACTIVE",
+      "userType": "USER",
+      "credentialProvider": "OKTA",
+      "department": "Finance",
+      "title": null,
+      "manager": null,
+      "countryCode": "IE",
+      "groups": [
+        "00gFFF66666666666"
+      ],
+      "apps": [],
+      "profile": {
+        "countryCode": "IE",
+        "department": "Finance",
+        "email": "o.brien@example.com",
+        "firstName": "Siobhan",
+        "lastName": "O'Brien",
+        "login": "o.brien+test@example.com"
+      }
+    },
+    {
+      "id": "00uFFF66666666666",
+      "login": "grace.hopper@example.com",
+      "email": "grace.hopper@example.com",
+      "firstName": "Grace",
+      "lastName": "Hopper",
+      "status": "STAGED",
+      "userType": "USER",
+      "credentialProvider": "OKTA",
+      "department": "Finance",
+      "title": null,
+      "manager": null,
+      "countryCode": "US",
+      "groups": [
+        "00gDDD44444444444",
+        "00gFFF66666666666"
+      ],
+      "apps": [],
+      "profile": {
+        "city": "Arlington",
+        "costCenter": "FIN-100",
+        "countryCode": "US",
+        "department": "Finance",
+        "email": "grace.hopper@example.com",
+        "firstName": "Grace",
+        "lastName": "Hopper",
+        "login": "grace.hopper@example.com"
+      }
+    },
+    {
+      "id": "00uGGG77777777777",
+      "login": "mary.jackson@example.com",
+      "email": "mary.jackson@example.com",
+      "firstName": "Mary",
+      "lastName": "Jackson",
+      "status": "LOCKED_OUT",
+      "userType": "USER",
+      "credentialProvider": "OKTA",
+      "department": "Finance",
+      "title": "Analyst",
+      "manager": null,
+      "countryCode": "GB",
+      "groups": [
+        "00gDDD44444444444",
+        "00gEEE55555555555",
+        "00gFFF66666666666"
+      ],
+      "apps": [],
+      "profile": {
+        "costCenter": "FIN-100",
+        "countryCode": "GB",
+        "department": "Finance",
+        "email": "mary.jackson@example.com",
+        "firstName": "Mary",
+        "lastName": "Jackson",
+        "login": "mary.jackson@example.com",
+        "title": "Analyst"
+      }
+    },
+    {
+      "id": "00uHHH88888888888",
+      "login": "sobrien@example.com",
+      "email": "sobrien@example.com",
+      "firstName": "S",
+      "lastName": "OBrien",
+      "status": "ACTIVE",
+      "userType": "USER",
+      "credentialProvider": "OKTA",
+      "department": null,
+      "title": null,
+      "manager": null,
+      "countryCode": null,
+      "groups": [
+        "00gFFF66666666666"
+      ],
+      "apps": [],
+      "profile": {
+        "email": "sobrien@example.com",
+        "firstName": "S",
+        "lastName": "OBrien",
+        "login": "sobrien@example.com"
       }
     }
   ],
@@ -117,6 +233,9 @@
         "00uBBB22222222222"
       ],
       "assignedApps": [],
+      "ruleIds": [
+        "0prRULE1111111111"
+      ],
       "dynamicRule": "user.department == \"Engineering\"",
       "dynamicRuleStatus": "ACTIVE"
     },
@@ -131,22 +250,76 @@
       "assignedApps": [
         "0oaAAA11111111111"
       ],
+      "ruleIds": [],
       "dynamicRule": null,
       "dynamicRuleStatus": null
     },
     {
       "id": "00gCCC33333333333",
-      "name": "Everyone",
-      "description": "All active users",
+      "name": "All Staff",
+      "description": "Everyone with an example.com address",
       "type": "OKTA_GROUP",
       "members": [
         "00uAAA11111111111",
         "00uBBB22222222222",
         "00uCCC33333333333"
       ],
-      "assignedApps": [],
+      "assignedApps": [
+        "0oaDDD44444444444"
+      ],
+      "ruleIds": [
+        "0prRULE2222222222"
+      ],
       "dynamicRule": "String.stringContains(user.email, \"@example.com\")",
       "dynamicRuleStatus": "ACTIVE"
+    },
+    {
+      "id": "00gDDD44444444444",
+      "name": "Finance",
+      "description": "Finance cost centre",
+      "type": "OKTA_GROUP",
+      "members": [
+        "00uFFF66666666666",
+        "00uGGG77777777777"
+      ],
+      "assignedApps": [],
+      "ruleIds": [
+        "0prRULE3333333333"
+      ],
+      "dynamicRule": "user.costCenter == \"FIN-100\" AND user.department == \"Finance\"",
+      "dynamicRuleStatus": "ACTIVE"
+    },
+    {
+      "id": "00gEEE55555555555",
+      "name": "Contractors",
+      "description": "Assigned by hand",
+      "type": "OKTA_GROUP",
+      "members": [
+        "00uGGG77777777777"
+      ],
+      "assignedApps": [],
+      "ruleIds": [],
+      "dynamicRule": null,
+      "dynamicRuleStatus": null
+    },
+    {
+      "id": "00gFFF66666666666",
+      "name": "Everyone",
+      "description": "All users in your organization",
+      "type": "BUILT_IN",
+      "members": [
+        "00uAAA11111111111",
+        "00uBBB22222222222",
+        "00uCCC33333333333",
+        "00uEEE55555555555",
+        "00uFFF66666666666",
+        "00uGGG77777777777",
+        "00uHHH88888888888"
+      ],
+      "assignedApps": [],
+      "ruleIds": [],
+      "dynamicRule": null,
+      "dynamicRuleStatus": null
     }
   ],
   "apps": [
@@ -157,9 +330,14 @@
       "status": "ACTIVE",
       "signOnMode": "SAML_2_0",
       "sso": {
-        "issuer": "http://www.okta.com/0oaAAA11111111111",
+        "ssoAcsUrl": "https://slack.com/sso/saml",
         "audience": "https://slack.com",
-        "subjectNameIdFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+        "recipient": "https://slack.com/sso/saml",
+        "destination": "https://slack.com/sso/saml",
+        "subjectNameIdFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        "assertionSigned": true,
+        "responseSigned": true,
+        "oktaMetadataPath": "/api/v1/apps/0oaAAA11111111111/sso/saml/metadata"
       },
       "assignedGroups": [
         "00gBBB22222222222"
@@ -168,7 +346,10 @@
         "00uAAA11111111111",
         "00uBBB22222222222"
       ],
-      "owner": null
+      "assignedUsersDirect": [
+        "00uAAA11111111111"
+      ],
+      "owner": ""
     },
     {
       "id": "0oaBBB22222222222",
@@ -177,7 +358,6 @@
       "status": "ACTIVE",
       "signOnMode": "OPENID_CONNECT",
       "sso": {
-        "issuer": "http://www.okta.com/0oaBBB22222222222",
         "clientId": "0oabReportBotClientId",
         "grantTypes": [
           "client_credentials"
@@ -185,7 +365,8 @@
       },
       "assignedGroups": [],
       "assignedUsers": [],
-      "owner": null
+      "assignedUsersDirect": null,
+      "owner": ""
     },
     {
       "id": "0oaCCC33333333333",
@@ -194,14 +375,30 @@
       "status": "ACTIVE",
       "signOnMode": "BOOKMARK",
       "sso": {
-        "issuer": "http://www.okta.com/0oaCCC33333333333",
         "url": "https://wiki.example.com"
       },
       "assignedGroups": [],
       "assignedUsers": [
         "00uAAA11111111111"
       ],
-      "owner": null
+      "assignedUsersDirect": [
+        "00uAAA11111111111"
+      ],
+      "owner": ""
+    },
+    {
+      "id": "0oaDDD44444444444",
+      "name": "office365",
+      "label": "Microsoft Office 365",
+      "status": "ACTIVE",
+      "signOnMode": "WS_FEDERATION",
+      "sso": {},
+      "assignedGroups": [
+        "00gCCC33333333333"
+      ],
+      "assignedUsers": [],
+      "assignedUsersDirect": null,
+      "owner": ""
     }
   ],
   "policies": [
@@ -210,6 +407,7 @@
       "name": "Default Policy",
       "type": "OKTA_SIGN_ON",
       "status": "ACTIVE",
+      "system": null,
       "rules": [
         {
           "id": "0prAAA11111111111",
@@ -220,6 +418,38 @@
               "users": {
                 "exclude": [],
                 "include": []
+              }
+            }
+          },
+          "actions": {}
+        }
+      ]
+    },
+    {
+      "id": "rstAAA11111111111",
+      "name": "Slack app sign-in",
+      "type": "ACCESS_POLICY",
+      "status": "ACTIVE",
+      "system": false,
+      "rules": [
+        {
+          "id": "rulAAA11111111111",
+          "name": "Require MFA off-network",
+          "status": "ACTIVE",
+          "conditions": {
+            "network": {
+              "connection": "ZONE",
+              "exclude": [
+                "nzoCORP"
+              ]
+            }
+          },
+          "actions": {
+            "appSignOn": {
+              "access": "ALLOW",
+              "verificationMethod": {
+                "factorMode": "2FA",
+                "type": "ASSURANCE"
               }
             }
           }
@@ -252,7 +482,43 @@
       "scopes": []
     }
   ],
-  "exportedAt": "2026-09-30T07:13:56Z",
+  "groupRules": [
+    {
+      "id": "0prRULE1111111111",
+      "name": "Engineering by department",
+      "status": "ACTIVE",
+      "expression": "user.department == \"Engineering\"",
+      "targetGroupIds": [
+        "00gAAA11111111111"
+      ],
+      "excludedUserIds": [],
+      "excludedGroupIds": []
+    },
+    {
+      "id": "0prRULE2222222222",
+      "name": "All example.com staff",
+      "status": "ACTIVE",
+      "expression": "String.stringContains(user.email, \"@example.com\")",
+      "targetGroupIds": [
+        "00gCCC33333333333"
+      ],
+      "excludedUserIds": [],
+      "excludedGroupIds": []
+    },
+    {
+      "id": "0prRULE3333333333",
+      "name": "Finance cost centre",
+      "status": "ACTIVE",
+      "expression": "user.costCenter == \"FIN-100\" AND user.department == \"Finance\"",
+      "targetGroupIds": [
+        "00gDDD44444444444"
+      ],
+      "excludedUserIds": [],
+      "excludedGroupIds": []
+    }
+  ],
+  "exportErrors": {},
+  "exportedAt": "2026-10-09T22:44:42Z",
   "source": {
     "live": false,
     "rawFile": "fixtures/okta-raw.sample.json"
