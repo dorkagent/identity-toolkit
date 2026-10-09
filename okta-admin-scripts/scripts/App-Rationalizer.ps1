@@ -1,11 +1,12 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Ranks Okta apps by recent login activity and flags duplicates and removal candidates.
 
 .DESCRIPTION
     Read-only. Lists all Okta apps (Get-OktaApps), then makes a single pass over the
-    System Log for SSO and session-start events to tally logins per app over
-    -LookbackDays. For each app it also counts assigned users (Get-OktaAppUsers)
+    System Log for user.authentication.sso events to tally sign-ins per app
+    over -LookbackDays (90 days at most; that is all Okta keeps). For each app it also counts assigned users (Get-OktaAppUsers)
     and computes three kinds of duplication flags:
 
       DuplicateLabel   two or more apps share the same normalized label
@@ -19,9 +20,8 @@
     lookback window AND zero assigned users. Output is ranked by login count
     (descending), then assigned-user count (descending).
 
-    Table output by default; -Json for machine-readable output; -Output writes
-    the report to a file. Requires OKTA_DOMAIN and OKTA_API_TOKEN environment
-    variables. Secrets are never hardcoded.
+    Table output by default; -Json for machine-readable output; -Output also
+    writes the report to a file (JSON with -Json, otherwise CSV).
 
 .PARAMETER LookbackDays
     How many days back to scan the System Log for logins. Default 90.
@@ -100,7 +100,8 @@ foreach ($a in $apps) { $appIds[[string]$a.id] = $a }
 
 # --- Single pass over the System Log: tally logins per app -------------------
 $cutoff = (Get-Date).ToUniversalTime().AddDays(-$LookbackDays).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-$filter = 'eventType eq "user.authentication.sso" or eventType eq "user.session.start"'
+# user.session.start targets the user, not an app, so only SSO events count.
+$filter = 'eventType eq "user.authentication.sso"'
 $logins = @{}
 foreach ($e in (Get-OktaLogs -Client $client -Filter $filter -Since $cutoff)) {
     foreach ($t in @($e.target)) {
@@ -194,6 +195,6 @@ if ($Json) {
     Write-Output $text
 }
 else {
-    if ($Output) { $sorted | Format-Table -AutoSize | Out-String | Out-File -FilePath $Output -Encoding utf8 }
-    $sorted | Format-Table -AutoSize
+    if ($Output) { $sorted | Export-OktaCsv -Path $Output }
+    $sorted | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
 }
