@@ -1,1 +1,3 @@
 requests>=2.31
+# Only needed for OAuth (private_key_jwt) auth:
+pyjwt[crypto]>=2.8

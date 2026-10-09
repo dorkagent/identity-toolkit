@@ -1,355 +1,323 @@
 #!/usr/bin/env python3
-"""Joiner / Mover / Leaver provisioning kit.
+"""Joiner / mover / leaver changes driven by a CSV file.
 
-Reads a CSV of user changes and applies them to Okta. DRY-RUN BY DEFAULT:
-without --apply it only reports what WOULD change. Re-runs are idempotent --
-already-correct state is skipped, not re-applied.
+CSV columns: login, firstName, lastName, email (optional, defaults to login),
+groups (names separated by ;), apps (app labels separated by ;).
 
-CSV columns:
-    login, firstName, lastName, email (optional, falls back to login),
-    groups (semicolon-separated group names), apps (semicolon-separated app labels)
+    joiner  create the user (staged, activate=false) or fix the profile of an
+            existing one, then add the listed groups and apps
+    mover   fix the profile, add missing groups and apps; with --prune also
+            remove groups and apps that are not in the row
+    leaver  deactivate the user and list what is still assigned
 
-Modes:
-    joiner  create the user (deactivated, via ?activate=false) or update the
-            profile of an existing one; add group memberships and app
-            assignments.
-    mover   update profile; add missing groups/apps from the CSV; remove
-            extras ONLY with --prune.
-    leaver  deactivate the user; report remaining app assignments and group
-            memberships for cleanup.
+Nothing changes without --apply. Running the same file twice is safe: state
+that is already correct is reported as skipped.
 
-Usage:
-    export OKTA_DOMAIN=https://dev-123456.okta.com
-    export OKTA_API_TOKEN=00...
-    python scripts/python/jml_automation_kit.py --mode joiner --csv hires.csv
-    python scripts/python/jml_automation_kit.py --mode joiner --csv hires.csv --apply
-    python scripts/python/jml_automation_kit.py --mode mover --csv moves.csv --apply --prune
-    python scripts/python/jml_automation_kit.py --mode leaver --csv exits.csv --apply
-    python scripts/python/jml_automation_kit.py --mode joiner --csv hires.csv --json --output plan.json
+Profile changes use POST /api/v1/users/{id}, which only touches the fields
+sent. (PUT replaces the whole profile and would wipe every attribute not in
+the CSV.)
+
+--prune is deliberately narrow. It only removes memberships of OKTA_GROUP
+groups, never BUILT_IN (Everyone) or APP_GROUP (imported from AD/LDAP), and
+only direct app assignments, never ones inherited from a group. It also refuses
+to prune a row whose groups or apps cell is empty, so a blank cell can't strip
+someone's access. Memberships that a group rule adds will come back on the next
+rule evaluation; fix the attribute that drives the rule instead.
+
+Examples:
+    python scripts/jml_automation_kit.py --mode joiner --csv hires.csv
+    python scripts/jml_automation_kit.py --mode joiner --csv hires.csv --apply
+    python scripts/jml_automation_kit.py --mode mover --csv moves.csv --apply --prune
+    python scripts/jml_automation_kit.py --mode leaver --csv exits.csv --apply --output leavers.csv
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import requests
-from lib.okta_client import OktaClient, OktaAuthError
+from lib.common import connect
+from lib.okta_client import OktaAuthError, OktaClient, OktaError, OktaNotFoundError, quote_filter_value
+from lib.output import emit, table
 
+PROFILE_FIELDS = ("firstName", "lastName", "email", "login")
 
-# ---- helpers ----
 
 def parse_list(value: str | None) -> list[str]:
     return [v.strip() for v in (value or "").split(";") if v.strip()]
 
 
-def check_exists(client: OktaClient, path: str) -> bool:
-    """True if GET path returns 200; False on 404; re-raise otherwise."""
-    try:
-        client._request("GET", path)
-        return True
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 404:
-            return False
-        raise
-
-
-def find_group(client: OktaClient, name: str) -> dict | None:
-    for g in client.list_groups(name):
-        if (g.get("profile") or {}).get("name") == name:
-            return g
-    return None
-
-
-def find_app(client: OktaClient, label: str) -> dict | None:
-    for a in client.paged_get("/api/v1/apps", {"q": label}):
-        if a.get("label") == label:
-            return a
-    return None
-
-
-def current_groups(client: OktaClient, uid: str) -> dict:
-    """name -> group dict for groups the user belongs to."""
-    out = {}
-    for g in client.paged_get(f"/api/v1/users/{uid}/groups"):
-        name = (g.get("profile") or {}).get("name")
-        if name:
-            out[name] = g
-    return out
-
-
-def current_apps(client: OktaClient, uid: str) -> dict:
-    """label -> app dict for apps assigned to the user."""
-    out = {}
-    for a in client.paged_get("/api/v1/apps", {"filter": f'user.id eq "{uid}"'}):
-        if a.get("label"):
-            out[a["label"]] = a
-    return out
-
-
-# ---- action log ----
-
-class ActionLog:
-    def __init__(self):
-        self.actions: list[dict] = []
-
-    def add(self, login: str, action: str, detail: str, status: str):
-        self.actions.append({
-            "login": login, "action": action, "detail": detail, "status": status,
-        })
-
-    def changed(self) -> int:
-        return sum(1 for a in self.actions if a["status"] in ("done", "dry-run"))
-
-
-def do_write(client: OktaClient, method: str, path: str, data: dict | None,
-             log: ActionLog, login: str, action: str, detail: str, apply: bool):
-    """Gate every write behind --apply; log what happened or would happen."""
-    if not apply:
-        log.add(login, action, f"WOULD {detail}", "dry-run")
-        return
-    getattr(client, method)(path, data)
-    log.add(login, action, detail, "done")
-
-
-# ---- per-mode processing ----
-
-def sync_profile(client: OktaClient, log: ActionLog, login: str, user: dict,
-                 row: dict, apply: bool):
-    desired = {
+def desired_profile(row: dict) -> dict:
+    login = (row.get("login") or "").strip()
+    return {
         "firstName": (row.get("firstName") or "").strip(),
         "lastName": (row.get("lastName") or "").strip(),
         "email": (row.get("email") or "").strip() or login,
         "login": login,
     }
-    profile = user.get("profile", {})
-    changed = {k: v for k, v in desired.items() if profile.get(k) != v}
+
+
+class Plan:
+    """Collects what was done, or would be done, for one run."""
+
+    def __init__(self, client: OktaClient, apply: bool):
+        self.client = client
+        self.apply = apply
+        self.actions: list[dict] = []
+        self._groups: dict[str, dict | None] = {}
+        self._apps: dict[str, dict | None] = {}
+
+    def log(self, login, action, detail, status):
+        self.actions.append({"login": login, "action": action,
+                             "detail": detail, "status": status})
+
+    def write(self, login, action, detail, method, path, data=None):
+        if not self.apply:
+            self.log(login, action, f"would {detail}", "dry-run")
+            return None
+        result = getattr(self.client, method)(path, data)
+        self.log(login, action, detail, "done")
+        return result
+
+    def find_group(self, name: str) -> dict | None:
+        if name not in self._groups:
+            self._groups[name] = next(
+                (g for g in self.client.list_groups(name)
+                 if (g.get("profile") or {}).get("name") == name), None)
+        return self._groups[name]
+
+    def find_app(self, label: str) -> dict | None:
+        if label not in self._apps:
+            self._apps[label] = next(
+                (a for a in self.client.paged_get("/api/v1/apps", {"q": label})
+                 if a.get("label") == label), None)
+        return self._apps[label]
+
+
+def current_groups(client: OktaClient, uid: str) -> dict[str, dict]:
+    return {(g.get("profile") or {}).get("name"): g
+            for g in client.list_user_groups(uid)
+            if (g.get("profile") or {}).get("name")}
+
+
+def current_apps(client: OktaClient, uid: str) -> dict[str, dict]:
+    flt = f'user.id eq "{quote_filter_value(uid)}"'
+    return {a["label"]: a for a in client.paged_get("/api/v1/apps", {"filter": flt})
+            if a.get("label")}
+
+
+def sync_profile(plan: Plan, login: str, user: dict, row: dict) -> None:
+    profile = user.get("profile") or {}
+    want = desired_profile(row)
+    changed = {k: v for k, v in want.items() if profile.get(k) != v}
     if not changed:
-        log.add(login, "update_profile", "profile already correct", "skipped")
+        plan.log(login, "update_profile", "profile already matches", "skipped")
         return
-    detail = f"update profile: {', '.join(f'{k}={v}' for k, v in changed.items())}"
-    new_profile = dict(profile)
-    new_profile.update(desired)
-    if not apply:
-        log.add(login, "update_profile", f"WOULD {detail}", "dry-run")
-        return
-    client.put(f"/api/v1/users/{user['id']}", {"profile": new_profile})
-    log.add(login, "update_profile", detail, "done")
+    detail = "update " + ", ".join(f"{k}={v}" for k, v in changed.items())
+    # POST is a partial update: only the changed keys are sent.
+    plan.write(login, "update_profile", detail, "post",
+               f"/api/v1/users/{user['id']}", {"profile": changed})
 
 
-def add_groups_apps(client: OktaClient, log: ActionLog, login: str, uid: str,
-                    group_names: list, app_labels: list, apply: bool):
-    for name in group_names:
-        group = find_group(client, name)
+def add_groups(plan: Plan, login: str, uid: str | None, names: list[str],
+               have: dict[str, dict]) -> None:
+    for name in names:
+        if name in have:
+            plan.log(login, "add_group", f"already a member of {name}", "skipped")
+            continue
+        group = plan.find_group(name)
         if group is None:
-            log.add(login, "add_group", f"group not found: {name}", "error")
+            plan.log(login, "add_group", f"group not found: {name}", "error")
+        elif group.get("type") != "OKTA_GROUP":
+            plan.log(login, "add_group",
+                     f"{name} is {group.get('type')}; Okta only allows changes to "
+                     "OKTA_GROUP memberships", "error")
+        elif uid is None:
+            plan.log(login, "add_group", f"would add to {name} after creation", "dry-run")
+        else:
+            plan.write(login, "add_group", f"add to {name}", "put",
+                       f"/api/v1/groups/{group['id']}/users/{uid}")
+
+
+def add_apps(plan: Plan, login: str, uid: str | None, labels: list[str],
+             have: dict[str, dict]) -> None:
+    for label in labels:
+        if label in have:
+            plan.log(login, "assign_app", f"already assigned {label}", "skipped")
             continue
-        if check_exists(client, f"/api/v1/groups/{group['id']}/users/{uid}"):
-            log.add(login, "add_group", f"already member: {name}", "skipped")
-            continue
-        do_write(client, "post", f"/api/v1/groups/{group['id']}/users/{uid}", {},
-                 log, login, "add_group", f"add to group: {name}", apply)
-    for label in app_labels:
-        app = find_app(client, label)
+        app = plan.find_app(label)
         if app is None:
-            log.add(login, "assign_app", f"app not found: {label}", "error")
-            continue
-        if check_exists(client, f"/api/v1/apps/{app['id']}/users/{uid}"):
-            log.add(login, "assign_app", f"already assigned: {label}", "skipped")
-            continue
-        do_write(client, "post", f"/api/v1/apps/{app['id']}/users", {"id": uid},
-                 log, login, "assign_app", f"assign app: {label}", apply)
+            plan.log(login, "assign_app", f"app not found: {label}", "error")
+        elif uid is None:
+            plan.log(login, "assign_app", f"would assign {label} after creation", "dry-run")
+        else:
+            plan.write(login, "assign_app", f"assign {label}", "post",
+                       f"/api/v1/apps/{app['id']}/users", {"id": uid})
 
 
-def process_joiner(client: OktaClient, row: dict, apply: bool) -> list[dict]:
-    log = ActionLog()
-    login = (row.get("login") or "").strip()
-    if not login:
-        log.add("?", "create_user", "row missing login", "error")
-        return log.actions
-    user = client.get_user_by_login(login)
-    if user is None:
-        profile = {
-            "firstName": (row.get("firstName") or "").strip(),
-            "lastName": (row.get("lastName") or "").strip(),
-            "email": (row.get("email") or "").strip() or login,
-            "login": login,
-        }
-        do_write(client, "post", "/api/v1/users?activate=false",
-                 {"profile": profile}, log, login, "create_user",
-                 f"create user (activate=false): {profile}", apply)
-        # Groups/apps cannot be resolved without a user id on a dry run.
-        for name in parse_list(row.get("groups")):
-            log.add(login, "add_group", f"pending user creation: {name}", "skipped")
-        for label in parse_list(row.get("apps")):
-            log.add(login, "assign_app", f"pending user creation: {label}", "skipped")
-        return log.actions
-    sync_profile(client, log, login, user, row, apply)
-    add_groups_apps(client, log, login, user["id"],
-                    parse_list(row.get("groups")), parse_list(row.get("apps")), apply)
-    return log.actions
+def prune(plan: Plan, login: str, uid: str, row: dict,
+          have_groups: dict[str, dict], have_apps: dict[str, dict]) -> None:
+    want_groups = set(parse_list(row.get("groups")))
+    want_apps = set(parse_list(row.get("apps")))
 
-
-def process_mover(client: OktaClient, row: dict, apply: bool, prune: bool) -> list[dict]:
-    log = ActionLog()
-    login = (row.get("login") or "").strip()
-    if not login:
-        log.add("?", "update_profile", "row missing login", "error")
-        return log.actions
-    user = client.get_user_by_login(login)
-    if user is None:
-        log.add(login, "update_profile", "user not found", "error")
-        return log.actions
-    uid = user["id"]
-    sync_profile(client, log, login, user, row, apply)
-
-    desired_groups = parse_list(row.get("groups"))
-    desired_apps = parse_list(row.get("apps"))
-    have_groups = current_groups(client, uid)
-    have_apps = current_apps(client, uid)
-
-    add_groups_apps(client, log, login, uid,
-                    [g for g in desired_groups if g not in have_groups],
-                    [a for a in desired_apps if a not in have_apps], apply)
-    for name in [g for g in desired_groups if g in have_groups]:
-        log.add(login, "add_group", f"already member: {name}", "skipped")
-    for label in [a for a in desired_apps if a in have_apps]:
-        log.add(login, "assign_app", f"already assigned: {label}", "skipped")
-
-    # Extras: removed only with --prune (and --apply for the real write).
-    for name in sorted(set(have_groups) - set(desired_groups)):
-        gid = have_groups[name]["id"]
-        if not prune:
-            log.add(login, "remove_group",
-                    f"extra group kept (--prune not set): {name}", "skipped")
-            continue
-        do_write(client, "delete", f"/api/v1/groups/{gid}/users/{uid}", None,
-                 log, login, "remove_group", f"remove from group: {name}", apply)
-    for label in sorted(set(have_apps) - set(desired_apps)):
-        aid = have_apps[label]["id"]
-        if not prune:
-            log.add(login, "unassign_app",
-                    f"extra app kept (--prune not set): {label}", "skipped")
-            continue
-        do_write(client, "delete", f"/api/v1/apps/{aid}/users/{uid}", None,
-                 log, login, "unassign_app", f"unassign app: {label}", apply)
-    return log.actions
-
-
-def process_leaver(client: OktaClient, row: dict, apply: bool) -> list[dict]:
-    log = ActionLog()
-    login = (row.get("login") or "").strip()
-    if not login:
-        log.add("?", "deactivate", "row missing login", "error")
-        return log.actions
-    user = client.get_user_by_login(login)
-    if user is None:
-        log.add(login, "deactivate", "user not found", "error")
-        return log.actions
-    uid = user["id"]
-    if user.get("status") == "ACTIVE":
-        do_write(client, "post", f"/api/v1/users/{uid}/lifecycle/deactivate", None,
-                 log, login, "deactivate", "deactivate user", apply)
+    if not want_groups:
+        plan.log(login, "remove_group", "groups cell is empty; not pruning groups", "skipped")
     else:
-        log.add(login, "deactivate",
-                f"already {user.get('status', 'not active')}", "skipped")
-    apps = current_apps(client, uid)
-    groups = current_groups(client, uid)
-    log.add(login, "remaining_apps",
-            ", ".join(sorted(apps)) or "none", "info")
-    log.add(login, "remaining_groups",
-            ", ".join(sorted(groups)) or "none", "info")
-    return log.actions
+        for name in sorted(set(have_groups) - want_groups):
+            g = have_groups[name]
+            if g.get("type") != "OKTA_GROUP":
+                plan.log(login, "remove_group",
+                         f"kept {name}: {g.get('type')} membership is not managed here",
+                         "skipped")
+                continue
+            plan.write(login, "remove_group", f"remove from {name}", "delete",
+                       f"/api/v1/groups/{g['id']}/users/{uid}")
+
+    if not want_apps:
+        plan.log(login, "unassign_app", "apps cell is empty; not pruning apps", "skipped")
+        return
+    for label in sorted(set(have_apps) - want_apps):
+        aid = have_apps[label]["id"]
+        try:
+            scope = (plan.client.get(f"/api/v1/apps/{aid}/users/{uid}") or {}).get("scope")
+        except OktaNotFoundError:
+            scope = None
+        if scope != "USER":
+            plan.log(login, "unassign_app",
+                     f"kept {label}: assigned through a group (scope {scope})", "skipped")
+            continue
+        plan.write(login, "unassign_app", f"unassign {label}", "delete",
+                   f"/api/v1/apps/{aid}/users/{uid}")
 
 
-# ---- output ----
+def process_joiner(plan: Plan, row: dict) -> None:
+    login = desired_profile(row)["login"]
+    user = plan.client.get_user_by_login(login)
+    if user is None:
+        # Put the user in their OKTA_GROUP groups in the create call (groupIds).
+        # An admin whose role is scoped to groups may only create users inside
+        # those groups: a create without groupIds gets HTTP 403 for them, even
+        # when every group in the row is theirs.
+        names = parse_list(row.get("groups"))
+        at_create = [n for n in names
+                     if (plan.find_group(n) or {}).get("type") == "OKTA_GROUP"]
+        body = {"profile": desired_profile(row)}
+        detail = "create user (staged, activate=false)"
+        if at_create:
+            body["groupIds"] = [plan.find_group(n)["id"] for n in at_create]
+            detail += " in " + ", ".join(at_create)
+        created = plan.write(login, "create_user", detail,
+                             "post", "/api/v1/users?activate=false", body)
+        uid = (created or {}).get("id")
+        add_groups(plan, login, uid, [n for n in names if n not in at_create], {})
+        add_apps(plan, login, uid, parse_list(row.get("apps")), {})
+        return
+    sync_profile(plan, login, user, row)
+    add_groups(plan, login, user["id"], parse_list(row.get("groups")),
+               current_groups(plan.client, user["id"]))
+    add_apps(plan, login, user["id"], parse_list(row.get("apps")),
+             current_apps(plan.client, user["id"]))
 
-def print_table(actions: list[dict]):
-    print(f"{'LOGIN':36} {'ACTION':16} {'STATUS':9} DETAIL")
-    print("-" * 130)
-    for a in actions:
-        print(f"{(a['login'] or '')[:36]:36} {a['action'][:16]:16} "
-              f"{a['status']:9} {(a['detail'] or '')[:70]}")
+
+def process_mover(plan: Plan, row: dict, do_prune: bool) -> None:
+    login = desired_profile(row)["login"]
+    user = plan.client.get_user_by_login(login)
+    if user is None:
+        plan.log(login, "update_profile", "user not found", "error")
+        return
+    uid = user["id"]
+    sync_profile(plan, login, user, row)
+    have_groups = current_groups(plan.client, uid)
+    have_apps = current_apps(plan.client, uid)
+    add_groups(plan, login, uid, parse_list(row.get("groups")), have_groups)
+    add_apps(plan, login, uid, parse_list(row.get("apps")), have_apps)
+    if do_prune:
+        prune(plan, login, uid, row, have_groups, have_apps)
+    else:
+        extra_g = sorted(set(have_groups) - set(parse_list(row.get("groups"))))
+        extra_a = sorted(set(have_apps) - set(parse_list(row.get("apps"))))
+        if extra_g or extra_a:
+            plan.log(login, "extras", "not in CSV, kept (no --prune): "
+                     + ", ".join(extra_g + extra_a), "info")
 
 
-def main():
-    p = argparse.ArgumentParser(
-        description="Joiner/Mover/Leaver provisioning kit. Dry-run by default; "
-                    "pass --apply to make changes.")
-    p.add_argument("--mode", required=True, choices=["joiner", "mover", "leaver"],
-                   help="JML mode to run")
-    p.add_argument("--csv", required=True,
-                   help="CSV with columns: login, firstName, lastName, "
-                        "email (optional), groups (; separated), apps (; separated)")
-    p.add_argument("--apply", action="store_true",
-                   help="perform writes; without it, only report what would change")
+def process_leaver(plan: Plan, row: dict) -> None:
+    login = desired_profile(row)["login"]
+    user = plan.client.get_user_by_login(login)
+    if user is None:
+        plan.log(login, "deactivate", "user not found", "error")
+        return
+    uid = user["id"]
+    if user.get("status") in ("DEPROVISIONED",):
+        plan.log(login, "deactivate", "already deactivated", "skipped")
+    else:
+        plan.write(login, "deactivate", "deactivate user", "post",
+                   f"/api/v1/users/{uid}/lifecycle/deactivate")
+    plan.log(login, "remaining_apps", ", ".join(sorted(current_apps(plan.client, uid))) or "none", "info")
+    plan.log(login, "remaining_groups", ", ".join(sorted(current_groups(plan.client, uid))) or "none", "info")
+
+
+def run(client: OktaClient, rows: list[dict], mode: str, apply: bool,
+        do_prune: bool) -> list[dict]:
+    plan = Plan(client, apply)
+    for row in rows:
+        login = (row.get("login") or "").strip()
+        if not login:
+            plan.log("?", mode, "row has no login", "error")
+            continue
+        try:
+            if mode == "joiner":
+                process_joiner(plan, row)
+            elif mode == "mover":
+                process_mover(plan, row, do_prune)
+            else:
+                process_leaver(plan, row)
+        except OktaAuthError:
+            raise  # bad credentials will fail every row; stop now
+        except OktaError as e:
+            # Includes 403s on a single user or group: record and move on.
+            plan.log(login, mode, f"{type(e).__name__}: {e}", "error")
+    return plan.actions
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="CSV-driven joiner/mover/leaver changes "
+                                "(dry run unless --apply).")
+    p.add_argument("--mode", required=True, choices=["joiner", "mover", "leaver"])
+    p.add_argument("--csv", required=True, help="input CSV (see --help text above)")
+    p.add_argument("--apply", action="store_true", help="make the changes")
     p.add_argument("--prune", action="store_true",
-                   help="mover mode: also remove group/app assignments not in the CSV")
-    p.add_argument("--limit", type=int, default=0,
-                   help="only process N CSV rows (0 = all)")
-    p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    p.add_argument("--output", default=None, help="write report to file")
-    args = p.parse_args()
-
-    try:
-        client = OktaClient()
-    except OktaAuthError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+                   help="mover: also remove groups/apps not listed in the row")
+    p.add_argument("--limit", type=int, default=0, help="only process the first N rows")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.add_argument("--output", help="write the report here (.csv for CSV)")
+    args = p.parse_args(argv)
 
     with open(args.csv, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
+    if args.limit:
+        rows = rows[:args.limit]
 
-    actions: list[dict] = []
-    for n, row in enumerate(rows, 1):
-        if args.limit and n > args.limit:
-            break
-        try:
-            if args.mode == "joiner":
-                actions.extend(process_joiner(client, row, args.apply))
-            elif args.mode == "mover":
-                actions.extend(process_mover(client, row, args.apply, args.prune))
-            else:
-                actions.extend(process_leaver(client, row, args.apply))
-        except OktaAuthError:
-            raise
-        except Exception as e:  # per-row failure must not abort the batch
-            login = (row.get("login") or "?").strip()
-            actions.append({"login": login, "action": args.mode,
-                            "detail": f"{type(e).__name__}: {e}", "status": "error"})
+    client = connect()
+    actions = run(client, rows, args.mode, args.apply, args.prune)
 
-    counts = {}
+    counts: dict[str, int] = {}
     for a in actions:
         counts[a["status"]] = counts.get(a["status"], 0) + 1
-    summary = {"rows": len(rows[:args.limit] if args.limit else rows),
-               "actions": len(actions),
-               "changed_or_would_change": sum(
-                   1 for a in actions if a["status"] in ("done", "dry-run")),
-               **counts}
-
-    if args.json:
-        report = json.dumps({
-            "mode": args.mode, "csv": args.csv, "apply": args.apply,
-            "prune": args.prune, "summary": summary, "actions": actions,
-        }, indent=2)
-    else:
-        print_table(actions)
-        mode_word = "DRY RUN" if not args.apply else "APPLIED"
-        report = (f"\n[{mode_word}] rows: {summary['rows']} | actions: {summary['actions']} | "
-                  f"changed/would-change: {summary['changed_or_would_change']} | "
-                  f"errors: {counts.get('error', 0)}")
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report if args.json else report + "\n")
-        print(f"\nwrote {args.output}", file=sys.stderr)
-    elif not args.json:
-        print(report)
+    summary = {"mode": args.mode, "applied": args.apply, "prune": args.prune,
+               "rows": len(rows), **counts}
+    text = table([("LOGIN", 34), ("ACTION", 16), ("STATUS", 8), ("DETAIL", 0)],
+                 [[a["login"], a["action"], a["status"], a["detail"]] for a in actions])
+    text += (f"\n\n{'APPLIED' if args.apply else 'DRY RUN'}: {len(rows)} rows, "
+             f"{counts.get('done', 0) + counts.get('dry-run', 0)} changes, "
+             f"{counts.get('error', 0)} errors")
+    emit(report={"summary": summary, "actions": actions}, text=text,
+         as_json=args.json, output=args.output, csv_rows=actions,
+         csv_fields=["login", "action", "status", "detail"])
 
 
 if __name__ == "__main__":

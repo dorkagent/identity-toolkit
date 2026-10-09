@@ -1,68 +1,69 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Joiner/Mover/Leaver (JML) lifecycle automation kit for Okta. (DHQ-86)
+    Joiner / mover / leaver changes for Okta, driven by a CSV file.
 
 .DESCRIPTION
-    Drives user lifecycle changes from a CSV file. Columns: login, firstName,
-    lastName, email (optional, falls back to login), groups (semicolon-separated
-    group names), apps (semicolon-separated app labels).
+    CSV columns: login, firstName, lastName, email (optional, defaults to
+    login), groups (names separated by ;), apps (app labels separated by ;).
 
-    Modes:
-      joiner - Create the user (activate=false) when missing, otherwise update
-               the profile when it differs; add group memberships and app
-               assignments that are missing.
-      mover   - Update the profile; add missing group/app memberships; remove
-               extras ONLY when -Prune is also given.
-      leaver  - Deactivate the user via the lifecycle API and report remaining
-               app assignments and group memberships.
+      joiner  Create the user (staged, activate=false) or fix the profile of an
+              existing one, then add the listed groups and apps.
+      mover   Fix the profile and add missing groups and apps. With -Prune,
+              also remove groups and apps that are not in the row.
+      leaver  Deactivate the user and list what is still assigned.
 
-    DRY-RUN BY DEFAULT: without -Apply the script only reports what WOULD
-    change. Every check is idempotent: already-correct state is skipped.
+    Nothing changes without -Apply. Re-running a file is safe; state that is
+    already right is reported and left alone.
 
-    Authentication comes from the OKTA_DOMAIN / OKTA_API_TOKEN environment
-    variables only.
+    Profile changes are sent with POST /api/v1/users/{id}, which only updates
+    the fields sent. PUT would replace the whole profile and wipe every
+    attribute that isn't in the CSV.
+
+    -Prune only removes OKTA_GROUP memberships (never Everyone or groups
+    imported from AD/LDAP) and only direct app assignments (not ones that
+    come from a group). It skips a row whose groups or apps cell is empty, so
+    a blank cell can't strip someone's access. Memberships added by a group
+    rule come back on the next rule run; change the attribute instead.
+
+    A failure on one row is recorded and the batch carries on. A 401 (bad
+    credentials) stops the run.
 
 .PARAMETER Mode
-    Required. One of: joiner, mover, leaver.
+    joiner, mover or leaver.
 
 .PARAMETER Csv
-    Required. Path to the input CSV file.
+    Path to the input CSV.
 
 .PARAMETER Apply
-    Execute the changes. Without -Apply this is a dry run (report only).
+    Make the changes. Without it the script only reports.
 
 .PARAMETER Prune
-    Mover mode only: remove group memberships and app assignments that are not
-    listed in the CSV row. Without -Prune, extras are reported and kept.
+    Mover mode: remove groups and apps not listed in the row (see above).
 
 .PARAMETER Json
-    Emit the report as JSON instead of a summary table.
+    Print JSON instead of a table.
 
 .PARAMETER Output
-    Write the report to this file path (JSON with -Json, CSV otherwise).
+    Also write the report to this file (JSON with -Json, otherwise CSV).
 
 .EXAMPLE
-    .\JML-AutomationKit.ps1 -Mode joiner -Csv .\new-hires.csv
+    ./JML-AutomationKit.ps1 -Mode joiner -Csv ./new-hires.csv
 
-    Dry run: report what creating/updating the new hires would change.
-
-.EXAMPLE
-    .\JML-AutomationKit.ps1 -Mode mover -Csv .\transfers.csv -Apply -Prune
-
-    Apply a mover: update profiles, add missing memberships, prune extras.
+    Show what creating the new hires would change.
 
 .EXAMPLE
-    .\JML-AutomationKit.ps1 -Mode leaver -Csv .\exits.csv -Apply -Json -Output .\leaver-report.json
+    ./JML-AutomationKit.ps1 -Mode mover -Csv ./transfers.csv -Apply -Prune
 
-    Deactivate exiting users and write a JSON report of remaining assignments.
+    Update profiles, add missing access and remove access not in the file.
+
+.EXAMPLE
+    ./JML-AutomationKit.ps1 -Mode leaver -Csv ./exits.csv -Apply -Output ./leavers.csv
 #>
-
+[CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateSet('joiner', 'mover', 'leaver')]
-    [string]$Mode,
-    [Parameter(Mandatory = $true)]
-    [string]$Csv,
+    [Parameter(Mandatory)][ValidateSet('joiner', 'mover', 'leaver')][string]$Mode,
+    [Parameter(Mandatory)][string]$Csv,
     [switch]$Apply,
     [switch]$Prune,
     [switch]$Json,
@@ -70,289 +71,228 @@ param(
 )
 
 Import-Module "$PSScriptRoot/../lib/OktaClient.psm1" -Force
-$client = New-OktaClient
-
 $ErrorActionPreference = 'Stop'
 
-# Per-row accumulators (reset for every CSV row).
-$script:rowLog = @()
-$script:rowChanged = $false
-$script:rowRemainingApps = @()
-$script:rowRemainingGroups = @()
+if (-not (Test-Path -LiteralPath $Csv)) { throw "CSV file not found: $Csv" }
+$client = New-OktaClient
 
-function Add-RowLog {
-    param([string]$Message, [switch]$NoChange)
-    $script:rowLog += $Message
-    if (-not $NoChange) { $script:rowChanged = $true }
+$script:actions = [System.Collections.Generic.List[object]]::new()
+$script:groupCache = @{}
+$script:appCache = @{}
+
+function Add-Action {
+    param([string]$Login, [string]$Action, [string]$Detail, [string]$Status)
+    $script:actions.Add([pscustomobject]@{ Login = $Login; Action = $Action; Status = $Status; Detail = $Detail })
+}
+
+function Invoke-Change {
+    # Make a write when -Apply is set, otherwise record what would happen.
+    param([string]$Login, [string]$Action, [string]$Detail, [string]$Method, [string]$Path, $Body)
+    if (-not $Apply) { Add-Action $Login $Action "would $Detail" 'dry-run'; return $null }
+    $result = Invoke-OktaRequest -Client $client -Method $Method -Path $Path -Body $Body
+    Add-Action $Login $Action $Detail 'done'
+    return $result
 }
 
 function Split-List {
     param([string]$Value)
-    $out = @()
-    if ($Value) {
-        foreach ($part in ($Value -split ';')) {
-            $t = $part.Trim()
-            if ($t) { $out += $t }
-        }
-    }
-    return $out
+    @(($Value -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
-function Find-GroupExact {
+function Find-Group {
     param([string]$Name)
-    $cands = @(Get-OktaGroups -Client $client -Query $Name)
-    foreach ($g in $cands) {
-        if ([string]$g.name -eq $Name) { return $g }
+    if (-not $script:groupCache.ContainsKey($Name)) {
+        $script:groupCache[$Name] = Get-OktaGroups -Client $client -Query $Name |
+            Where-Object { [string]$_.profile.name -eq $Name } | Select-Object -First 1
     }
-    return $null
+    return $script:groupCache[$Name]
 }
 
-function Find-AppExact {
+function Find-App {
     param([string]$Label)
-    foreach ($a in $script:allApps) {
-        if ([string]$a.label -eq $Label) { return $a }
+    if (-not $script:appCache.ContainsKey($Label)) {
+        $script:appCache[$Label] = Invoke-OktaPagedGet -Client $client -Path '/api/v1/apps' -Query @{ q = $Label } |
+            Where-Object { [string]$_.label -eq $Label } | Select-Object -First 1
     }
-    return $null
+    return $script:appCache[$Label]
 }
 
-function Test-GroupMembership {
-    param([string]$GroupId, [string]$UserId)
-    try {
-        $null = Invoke-OktaRequest -Client $client -Method GET -Path "/api/v1/groups/$GroupId/users/$UserId"
-        return $true
-    } catch {
-        if ($_.Exception.Message -match '404') { return $false }
-        throw
+function Get-CurrentGroups {
+    param([string]$UserId)
+    $map = @{}
+    foreach ($g in Invoke-OktaPagedGet -Client $client -Path "/api/v1/users/$UserId/groups") {
+        if ($g.profile.name) { $map[[string]$g.profile.name] = $g }
     }
+    return $map
 }
 
-function Test-AppAssignment {
-    param([string]$AppId, [string]$UserId)
-    try {
-        $null = Invoke-OktaRequest -Client $client -Method GET -Path "/api/v1/apps/$AppId/users/$UserId"
-        return $true
-    } catch {
-        if ($_.Exception.Message -match '404') { return $false }
-        throw
+function Get-CurrentApps {
+    param([string]$UserId)
+    $map = @{}
+    $flt = "user.id eq `"$(ConvertTo-OktaFilterValue $UserId)`""
+    foreach ($a in Invoke-OktaPagedGet -Client $client -Path '/api/v1/apps' -Query @{ filter = $flt }) {
+        if ($a.label) { $map[[string]$a.label] = $a }
     }
+    return $map
 }
 
-function Add-GroupMember {
-    param([string]$GroupName, [string]$UserId)
-    $g = Find-GroupExact -Name $GroupName
-    if (-not $g) {
-        Add-RowLog -Message "Group not found: $GroupName" -NoChange
-        return
-    }
-    if (Test-GroupMembership -GroupId ([string]$g.id) -UserId $UserId) {
-        Add-RowLog -Message "Already member of group: $GroupName" -NoChange
-        return
-    }
-    if ($Apply) {
-        $null = Invoke-OktaRequest -Client $client -Method POST -Path "/api/v1/groups/$($g.id)/users/$UserId" -Body @{}
-        Add-RowLog -Message "Added to group: $GroupName"
-    } else {
-        Add-RowLog -Message "Would add to group: $GroupName"
-    }
-}
-
-function Add-AppAssignment {
-    param([string]$AppLabel, [string]$UserId)
-    $a = Find-AppExact -Label $AppLabel
-    if (-not $a) {
-        Add-RowLog -Message "App not found: $AppLabel" -NoChange
-        return
-    }
-    if (Test-AppAssignment -AppId ([string]$a.id) -UserId $UserId) {
-        Add-RowLog -Message "Already assigned app: $AppLabel" -NoChange
-        return
-    }
-    if ($Apply) {
-        $null = Invoke-OktaRequest -Client $client -Method POST -Path "/api/v1/apps/$($a.id)/users" -Body @{ id = $UserId }
-        Add-RowLog -Message "Assigned app: $AppLabel"
-    } else {
-        Add-RowLog -Message "Would assign app: $AppLabel"
-    }
-}
-
-function Sync-UserProfile {
-    param($User, $Row, [string]$Email)
-    $changes = @()
-    if ([string]$User.profile.firstName -ne [string]$Row.firstName) { $changes += "firstName" }
-    if ([string]$User.profile.lastName -ne [string]$Row.lastName) { $changes += "lastName" }
-    if ([string]$User.profile.email -ne $Email) { $changes += "email" }
-    if ($changes.Count -eq 0) {
-        Add-RowLog -Message "Profile already up to date" -NoChange
-        return
-    }
-    $uid = [string]$User.id
-    if ($Apply) {
-        $body = @{ profile = @{
-            firstName = [string]$Row.firstName
-            lastName  = [string]$Row.lastName
-            email     = $Email
-            login     = [string]$Row.login
-        } }
-        $null = Invoke-OktaRequest -Client $client -Method PUT -Path "/api/v1/users/$uid" -Body $body
-        Add-RowLog -Message ("Updated profile: " + ($changes -join ", "))
-    } else {
-        Add-RowLog -Message ("Would update profile: " + ($changes -join ", "))
-    }
-}
-
-if (-not (Test-Path $Csv)) { throw "CSV file not found: $Csv" }
-if (-not $Apply) {
-    Write-Warning "Dry run: no changes will be applied. Use -Apply to execute."
-}
-
-$csvRows = @(Import-Csv -Path $Csv)
-$script:allApps = @(Get-OktaApps -Client $client)
-
-$details = @()
-foreach ($r in $csvRows) {
-    $script:rowLog = @()
-    $script:rowChanged = $false
-    $script:rowRemainingApps = @()
-    $script:rowRemainingGroups = @()
-
-    $login = [string]$r.login
-    if (-not $login) {
-        $details += [pscustomobject]@{
-            Login           = "(missing)"
-            Mode            = $Mode
-            Status          = "Skipped"
-            Actions         = @("Row has no login; skipped")
-            RemainingApps   = @()
-            RemainingGroups = @()
-        }
-        continue
-    }
-    $email = [string]$r.email
+function Get-DesiredProfile {
+    param($Row)
+    $login = ([string]$Row.login).Trim()
+    $email = ([string]$Row.email).Trim()
     if (-not $email) { $email = $login }
-    $desiredGroups = @(Split-List -Value ([string]$r.groups))
-    $desiredApps = @(Split-List -Value ([string]$r.apps))
+    return [ordered]@{
+        firstName = ([string]$Row.firstName).Trim()
+        lastName  = ([string]$Row.lastName).Trim()
+        email     = $email
+        login     = $login
+    }
+}
 
-    $user = Get-OktaUserByLogin -Client $client -Login $login
+function Sync-Profile {
+    param($User, $Row)
+    $login = ([string]$Row.login).Trim()
+    $changed = [ordered]@{}
+    $want = Get-DesiredProfile $Row
+    foreach ($k in $want.Keys) {
+        if ([string]$User.profile.$k -cne $want[$k]) { $changed[$k] = $want[$k] }
+    }
+    if ($changed.Count -eq 0) { Add-Action $login 'update_profile' 'profile already matches' 'skipped'; return }
+    $detail = 'update ' + (($changed.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')
+    # POST = partial update; only the changed keys are sent.
+    $null = Invoke-Change $login 'update_profile' $detail 'POST' "/api/v1/users/$($User.id)" @{ profile = $changed }
+}
 
-    if ($Mode -eq 'joiner') {
-        if (-not $user) {
-            if ($Apply) {
-                $body = @{ profile = @{
-                    firstName = [string]$r.firstName
-                    lastName  = [string]$r.lastName
-                    email     = $email
-                    login     = $login
-                } }
-                $user = Invoke-OktaRequest -Client $client -Method POST -Path "/api/v1/users?activate=false" -Body $body
-                Add-RowLog -Message "Created user (activate=false)"
-            } else {
-                Add-RowLog -Message "Would create user (activate=false)"
-                foreach ($gn in $desiredGroups) { Add-RowLog -Message "Would add to group: $gn" }
-                foreach ($an in $desiredApps) { Add-RowLog -Message "Would assign app: $an" }
-            }
+function Add-Groups {
+    param([string]$Login, [string]$UserId, [string[]]$Names, [hashtable]$Have)
+    foreach ($name in $Names) {
+        if ($Have.ContainsKey($name)) { Add-Action $Login 'add_group' "already a member of $name" 'skipped'; continue }
+        $g = Find-Group $name
+        if (-not $g) { Add-Action $Login 'add_group' "group not found: $name" 'error'; continue }
+        if ($g.type -ne 'OKTA_GROUP') {
+            Add-Action $Login 'add_group' "$name is $($g.type); only OKTA_GROUP memberships can be changed" 'error'; continue
         }
-        if ($user) {
-            Sync-UserProfile -User $user -Row $r -Email $email
-            $uid = [string]$user.id
-            foreach ($gn in $desiredGroups) { Add-GroupMember -GroupName $gn -UserId $uid }
-            foreach ($an in $desiredApps) { Add-AppAssignment -AppLabel $an -UserId $uid }
-        }
-    } elseif ($Mode -eq 'mover') {
-        if (-not $user) {
-            Add-RowLog -Message "User not found; mover requires an existing user" -NoChange
-        } else {
-            Sync-UserProfile -User $user -Row $r -Email $email
-            $uid = [string]$user.id
-            foreach ($gn in $desiredGroups) { Add-GroupMember -GroupName $gn -UserId $uid }
-            foreach ($an in $desiredApps) { Add-AppAssignment -AppLabel $an -UserId $uid }
+        if (-not $UserId) { Add-Action $Login 'add_group' "would add to $name after creation" 'dry-run'; continue }
+        $null = Invoke-Change $Login 'add_group' "add to $name" 'PUT' "/api/v1/groups/$($g.id)/users/$UserId" $null
+    }
+}
 
-            $currentGroups = @(Invoke-OktaPagedGet -Client $client -Path "/api/v1/users/$uid/groups")
-            foreach ($cg in $currentGroups) {
-                if ($desiredGroups -notcontains [string]$cg.name) {
-                    if ($Prune) {
-                        if ($Apply) {
-                            $null = Invoke-OktaRequest -Client $client -Method DELETE -Path "/api/v1/groups/$($cg.id)/users/$uid"
-                            Add-RowLog -Message "Removed from extra group: $($cg.name)"
-                        } else {
-                            Add-RowLog -Message "Would remove from extra group: $($cg.name)"
-                        }
-                    } else {
-                        Add-RowLog -Message "Extra group kept (use -Prune to remove): $($cg.name)" -NoChange
-                    }
-                }
-            }
+function Add-Apps {
+    param([string]$Login, [string]$UserId, [string[]]$Labels, [hashtable]$Have)
+    foreach ($label in $Labels) {
+        if ($Have.ContainsKey($label)) { Add-Action $Login 'assign_app' "already assigned $label" 'skipped'; continue }
+        $a = Find-App $label
+        if (-not $a) { Add-Action $Login 'assign_app' "app not found: $label" 'error'; continue }
+        if (-not $UserId) { Add-Action $Login 'assign_app' "would assign $label after creation" 'dry-run'; continue }
+        $null = Invoke-Change $Login 'assign_app' "assign $label" 'POST' "/api/v1/apps/$($a.id)/users" @{ id = $UserId }
+    }
+}
 
-            $currentApps = @(Invoke-OktaPagedGet -Client $client -Path '/api/v1/apps' -Query @{'filter'="user.id eq `"$uid`""})
-            foreach ($ca in $currentApps) {
-                if ($desiredApps -notcontains [string]$ca.label) {
-                    if ($Prune) {
-                        if ($Apply) {
-                            $null = Invoke-OktaRequest -Client $client -Method DELETE -Path "/api/v1/apps/$($ca.id)/users/$uid"
-                            Add-RowLog -Message "Unassigned extra app: $($ca.label)"
-                        } else {
-                            Add-RowLog -Message "Would unassign extra app: $($ca.label)"
-                        }
-                    } else {
-                        Add-RowLog -Message "Extra app kept (use -Prune to remove): $($ca.label)" -NoChange
-                    }
-                }
-            }
-        }
+function Remove-Extras {
+    param([string]$Login, [string]$UserId, $Row, [hashtable]$HaveGroups, [hashtable]$HaveApps)
+    $wantGroups = @(Split-List ([string]$Row.groups))
+    $wantApps = @(Split-List ([string]$Row.apps))
+
+    if ($wantGroups.Count -eq 0) {
+        Add-Action $Login 'remove_group' 'groups cell is empty; not pruning groups' 'skipped'
     } else {
-        # leaver
-        if (-not $user) {
-            Add-RowLog -Message "User not found; nothing to deactivate" -NoChange
-        } else {
-            $uid = [string]$user.id
-            if ([string]$user.status -ne 'ACTIVE') {
-                Add-RowLog -Message "User already $($user.status); no deactivation needed" -NoChange
-            } elseif ($Apply) {
-                $null = Invoke-OktaRequest -Client $client -Method POST -Path "/api/v1/users/$uid/lifecycle/deactivate"
-                Add-RowLog -Message "Deactivated user"
-            } else {
-                Add-RowLog -Message "Would deactivate user"
+        foreach ($name in ($HaveGroups.Keys | Sort-Object)) {
+            if ($wantGroups -contains $name) { continue }
+            $g = $HaveGroups[$name]
+            if ($g.type -ne 'OKTA_GROUP') {
+                Add-Action $Login 'remove_group' "kept $($name): $($g.type) membership is not managed here" 'skipped'; continue
             }
-            $remainingApps = @(Invoke-OktaPagedGet -Client $client -Path '/api/v1/apps' -Query @{'filter'="user.id eq `"$uid`""})
-            $remainingGroups = @(Invoke-OktaPagedGet -Client $client -Path "/api/v1/users/$uid/groups")
-            $script:rowRemainingApps = @($remainingApps | ForEach-Object { [string]$_.label })
-            $script:rowRemainingGroups = @($remainingGroups | ForEach-Object { [string]$_.name })
-            if ($script:rowRemainingApps.Count -gt 0 -or $script:rowRemainingGroups.Count -gt 0) {
-                Add-RowLog -Message ("Remaining assignments - apps: " + ($script:rowRemainingApps -join ", ") + "; groups: " + ($script:rowRemainingGroups -join ", ")) -NoChange
-            } else {
-                Add-RowLog -Message "No remaining app/group assignments" -NoChange
-            }
+            $null = Invoke-Change $Login 'remove_group' "remove from $name" 'DELETE' "/api/v1/groups/$($g.id)/users/$UserId" $null
         }
     }
 
-    $status = "NoChange"
-    if ($script:rowChanged) {
-        if ($Apply) { $status = "Changed" } else { $status = "WouldChange" }
+    if ($wantApps.Count -eq 0) {
+        Add-Action $Login 'unassign_app' 'apps cell is empty; not pruning apps' 'skipped'; return
     }
-    $details += [pscustomobject]@{
-        Login           = $login
-        Mode            = $Mode
-        Status          = $status
-        Actions         = @($script:rowLog)
-        RemainingApps   = @($script:rowRemainingApps)
-        RemainingGroups = @($script:rowRemainingGroups)
-    }
-}
-
-$summary = @()
-foreach ($d in $details) {
-    $summary += [pscustomobject]@{
-        Login   = $d.Login
-        Mode    = $d.Mode
-        Status  = $d.Status
-        Changes = ($d.Actions -join '; ')
+    foreach ($label in ($HaveApps.Keys | Sort-Object)) {
+        if ($wantApps -contains $label) { continue }
+        $aid = $HaveApps[$label].id
+        $appUser = Invoke-OktaRequest -Client $client -Method GET -Path "/api/v1/apps/$aid/users/$UserId"
+        if ($appUser.scope -ne 'USER') {
+            Add-Action $Login 'unassign_app' "kept $($label): assigned through a group (scope $($appUser.scope))" 'skipped'; continue
+        }
+        $null = Invoke-Change $Login 'unassign_app' "unassign $label" 'DELETE' "/api/v1/apps/$aid/users/$UserId" $null
     }
 }
 
+$rows = @(Import-Csv -LiteralPath $Csv)
+if (-not $Apply) { Write-Warning 'Dry run: nothing will change. Add -Apply to make the changes.' }
+
+foreach ($r in $rows) {
+    $login = ([string]$r.login).Trim()
+    if (-not $login) { Add-Action '?' $Mode 'row has no login' 'error'; continue }
+    try {
+        $user = Get-OktaUserByLogin -Client $client -Login $login
+        $groups = @(Split-List ([string]$r.groups))
+        $apps = @(Split-List ([string]$r.apps))
+        switch ($Mode) {
+            'joiner' {
+                if (-not $user) {
+                    # Put the user in their OKTA_GROUP groups in the create call (groupIds).
+                    # An admin whose role is scoped to groups may only create users inside
+                    # those groups: a create without groupIds gets HTTP 403 for them.
+                    $atCreate = @($groups | Where-Object { $g = Find-Group $_; $g -and $g.type -eq 'OKTA_GROUP' })
+                    $body = @{ profile = (Get-DesiredProfile $r) }
+                    $detail = 'create user (staged, activate=false)'
+                    if ($atCreate.Count) {
+                        $body.groupIds = @($atCreate | ForEach-Object { [string](Find-Group $_).id })
+                        $detail += ' in ' + ($atCreate -join ', ')
+                    }
+                    $created = Invoke-Change $login 'create_user' $detail 'POST' '/api/v1/users?activate=false' $body
+                    $uid = if ($created) { [string]$created.id } else { $null }
+                    Add-Groups $login $uid @($groups | Where-Object { $atCreate -notcontains $_ }) @{}
+                    Add-Apps $login $uid $apps @{}
+                } else {
+                    Sync-Profile $user $r
+                    Add-Groups $login $user.id $groups (Get-CurrentGroups $user.id)
+                    Add-Apps $login $user.id $apps (Get-CurrentApps $user.id)
+                }
+            }
+            'mover' {
+                if (-not $user) { Add-Action $login 'update_profile' 'user not found' 'error'; break }
+                Sync-Profile $user $r
+                $haveGroups = Get-CurrentGroups $user.id
+                $haveApps = Get-CurrentApps $user.id
+                Add-Groups $login $user.id $groups $haveGroups
+                Add-Apps $login $user.id $apps $haveApps
+                if ($Prune) {
+                    Remove-Extras $login $user.id $r $haveGroups $haveApps
+                } else {
+                    $extra = @($haveGroups.Keys | Where-Object { $groups -notcontains $_ }) +
+                             @($haveApps.Keys | Where-Object { $apps -notcontains $_ })
+                    if ($extra.Count) { Add-Action $login 'extras' ("not in CSV, kept (no -Prune): " + ($extra -join ', ')) 'info' }
+                }
+            }
+            'leaver' {
+                if (-not $user) { Add-Action $login 'deactivate' 'user not found' 'error'; break }
+                if ($user.status -eq 'DEPROVISIONED') {
+                    Add-Action $login 'deactivate' 'already deactivated' 'skipped'
+                } else {
+                    $null = Invoke-Change $login 'deactivate' 'deactivate user' 'POST' "/api/v1/users/$($user.id)/lifecycle/deactivate" $null
+                }
+                $remainingApps = (Get-CurrentApps $user.id).Keys | Sort-Object
+                $remainingGroups = (Get-CurrentGroups $user.id).Keys | Sort-Object
+                Add-Action $login 'remaining_apps' ((@($remainingApps) -join ', ') -replace '^$', 'none') 'info'
+                Add-Action $login 'remaining_groups' ((@($remainingGroups) -join ', ') -replace '^$', 'none') 'info'
+            }
+        }
+    } catch {
+        if ($_.Exception.Data['StatusCode'] -eq 401) { throw }
+        Add-Action $login $Mode $_.Exception.Message 'error'
+    }
+}
+
+$report = @($script:actions)
 if ($Json) {
-    $report = ($details | ConvertTo-Json -Depth 10)
-    Write-Output $report
-    if ($Output) { $report | Out-File -FilePath $Output -Encoding utf8 }
+    $text = ConvertTo-Json -InputObject $report -Depth 6
+    Write-Output $text
+    if ($Output) { $text | Out-File -LiteralPath $Output -Encoding utf8 }
 } else {
-    $summary | Format-Table -AutoSize -Wrap
-    if ($Output) { $summary | Export-Csv -Path $Output -NoTypeInformation }
+    $report | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Output
+    if ($Output) { $report | Export-OktaCsv -Path $Output }
 }

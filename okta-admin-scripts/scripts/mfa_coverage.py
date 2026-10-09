@@ -1,127 +1,86 @@
 #!/usr/bin/env python3
-"""MFA coverage auditor.
+"""MFA enrollment per user, from the factors API.
 
-Reports, for every active user, whether they have:
-  - no MFA enrolled at all,
-  - only phishable factors (push, TOTP, SMS, voice, email, security question),
-  - at least one phishing-resistant factor (WebAuthn/FIDO2, smart card).
+For each ACTIVE user, looks at factors with status ACTIVE and sorts the user
+into one of:
+    none              no active factor
+    phishable-only    only push, OTP, SMS, voice, email, security question
+    mixed             at least one phishing-resistant factor, but phishable
+                      ones are still enrolled and usable as a fallback
+    strong-only       only phishing-resistant factors (webauthn, u2f, FastPass)
+    unknown           a factor type this script doesn't recognise
 
-Usage:
-    export OKTA_DOMAIN=https://dev-123456.okta.com
-    export OKTA_API_TOKEN=00...
-    python scripts/mfa_coverage.py
-    python scripts/mfa_coverage.py --json --output report.json
-    python scripts/mfa_coverage.py --limit 25   # trial run on 25 users
+Caveat for Identity Engine orgs: GET /api/v1/users/{id}/factors only returns
+factors from the highest-priority authenticator enrollment policy and uses the
+calling admin's client context, so results can be incomplete. Okta's own MFA
+Usage report is the better source for a formal audit.
+
+Examples:
+    python scripts/mfa_coverage.py --limit 25
+    python scripts/mfa_coverage.py --json --output mfa.json
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import sys
 
-sys.path.insert(0, __import__("os").path.join(__import__("os").path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.okta_client import OktaClient, OktaAuthError
+from lib.common import connect
+from lib.okta_client import OktaError
+from lib.output import emit, table
 
-# factorType -> strength. Anything unlisted is reported as "unknown"
-# so new factor types surface instead of being silently misclassified.
-PHISHABLE = {
-    "push", "sms", "call", "question", "email",
-    "token:software:totp", "token:hardware", "token",
-}
-STRONG = {"webauthn", "smart_card"}
+# From the UserFactorType enum in the Okta management API spec.
+STRONG = {"webauthn", "u2f", "signed_nonce"}
+PHISHABLE = {"push", "sms", "call", "question", "email", "token:software:totp",
+             "token:hardware", "token:hotp", "token", "web"}
 
 
-def classify(factors: list) -> tuple[str, list[str]]:
-    """Return (verdict, enrolled factor types)."""
-    types = sorted({f.get("factorType", "?") for f in factors})
+def classify(factors: list[dict]) -> tuple[str, list[str]]:
+    types = sorted({f.get("factorType", "?") for f in factors if f.get("status") == "ACTIVE"})
     if not types:
         return "none", types
-    strengths = set()
-    for t in types:
-        if t in STRONG:
-            strengths.add("strong")
-        elif t in PHISHABLE:
-            strengths.add("phishable")
-        else:
-            strengths.add("unknown")
-    if strengths == {"strong"} or "strong" in strengths:
-        return "strong", types
-    if strengths == {"phishable"}:
-        return "phishable-only", types
-    return "unknown-mix", types
+    strong = [t for t in types if t in STRONG]
+    weak = [t for t in types if t in PHISHABLE]
+    if len(strong) + len(weak) < len(types):
+        return "unknown", types
+    if strong and weak:
+        return "mixed", types
+    return ("strong-only" if strong else "phishable-only"), types
 
 
-def audit(client: OktaClient, limit: int = 0, progress_every: int = 100):
+def audit(client, limit: int = 0) -> list[dict]:
     rows = []
-    for n, user in enumerate(client.list_users(), 1):
+    for n, user in enumerate(client.list_users(status="ACTIVE"), 1):
         if limit and n > limit:
             break
-        profile = user.get("profile", {})
-        factors = client.list_factors(user["id"])
-        verdict, types = classify(factors)
-        rows.append({
-            "login": profile.get("login"),
-            "name": f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip(),
-            "verdict": verdict,
-            "factors": types,
-        })
-        if n % progress_every == 0:
-            print(f"... scanned {n} users", file=sys.stderr)
+        profile = user.get("profile") or {}
+        try:
+            verdict, types = classify(client.list_factors(user["id"]))
+        except OktaError as e:
+            verdict, types = "error", [str(e)]
+        rows.append({"login": profile.get("login"), "verdict": verdict, "factors": types})
     return rows
 
 
-def print_table(rows: list):
-    verdicts = {"none": "NO MFA", "phishable-only": "PHISHABLE ONLY",
-                "strong": "STRONG", "unknown-mix": "UNKNOWN MIX"}
-    print(f"{'LOGIN':40} {'NAME':30} {'VERDICT':15} FACTORS")
-    print("-" * 110)
-    for r in rows:
-        print(f"{(r['login'] or '')[:40]:40} {(r['name'] or '')[:30]:30} "
-              f"{verdicts.get(r['verdict'], r['verdict']):15} {', '.join(r['factors'])}")
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Report MFA enrollment for active Okta users.")
+    p.add_argument("--limit", type=int, default=0, help="only check the first N users")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.add_argument("--output", help="write the report here (.csv for CSV)")
+    args = p.parse_args(argv)
 
-
-def main():
-    p = argparse.ArgumentParser(description="Audit MFA enrollment across Okta users.")
-    p.add_argument("--limit", type=int, default=0,
-                   help="only scan N users (0 = all)")
-    p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    p.add_argument("--output", default=None, help="write report to file")
-    args = p.parse_args()
-
-    try:
-        client = OktaClient()
-    except OktaAuthError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    rows = audit(client, limit=args.limit)
-
-    counts = {}
+    rows = audit(connect(), args.limit)
+    counts: dict[str, int] = {}
     for r in rows:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
-    summary = {"total_users": len(rows), **counts}
-
-    if args.json:
-        report = json.dumps({"summary": summary, "users": rows}, indent=2)
-    else:
-        print_table(rows)
-        report_lines = [
-            "",
-            f"Scanned: {summary['total_users']} users | "
-            f"no MFA: {counts.get('none', 0)} | "
-            f"phishable-only: {counts.get('phishable-only', 0)} | "
-            f"strong: {counts.get('strong', 0)}",
-        ]
-        report = "\n".join(report_lines)
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report if args.json else report + "\n")
-        print(f"\nwrote {args.output}", file=sys.stderr)
-    elif not args.json:
-        print(report)
+    text = table([("LOGIN", 40), ("VERDICT", 15), ("ACTIVE FACTORS", 0)],
+                 [[r["login"], r["verdict"], ", ".join(r["factors"])] for r in rows])
+    text += f"\n\n{len(rows)} users: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+    emit(report={"summary": {"users": len(rows), **counts}, "users": rows}, text=text,
+         as_json=args.json, output=args.output, csv_rows=rows)
 
 
 if __name__ == "__main__":

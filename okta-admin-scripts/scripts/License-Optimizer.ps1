@@ -1,10 +1,11 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Finds wasted Okta app licenses and duplicate user identities (read-only).
+    Rough per-app license waste estimate, plus users sharing an email (read-only).
 
 .DESCRIPTION
-    READ-ONLY. Makes one pass over System Log login events
-    (user.authentication.sso and user.session.start) within the last
+    Read-only. Makes one pass over System Log SSO events
+    (user.authentication.sso; at most 90 days, which is all Okta keeps) within the last
     -LookbackDays, tallying logins per app by matching event target ids
     against known app ids. Apps with zero logins but at least one assignment
     are waste candidates.
@@ -14,9 +15,11 @@
     and falls back to -CostDefault per seat. Candidates are ranked by
     estimated monthly waste, highest first.
 
-    Separately, users are grouped by lowercased login and by lowercased email;
-    groups of 2+ are reported as duplicate identities. Nothing is changed in
-    the tenant.
+    Separately, ACTIVE users sharing a lowercased email are listed (Okta
+    logins are unique, so there is no login check).
+
+    App-level only: apps that never emit user.authentication.sso (bookmarks,
+    provisioning-only apps, some OIDC flows) always look unused.
 
 .PARAMETER LookbackDays
     System Log window in days. Default 90.
@@ -64,7 +67,8 @@ param(
 Import-Module "$PSScriptRoot/../lib/OktaClient.psm1" -Force
 $client = New-OktaClient
 
-$cutoffIso = (Get-Date).ToUniversalTime().AddDays(-$LookbackDays).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+if ($LookbackDays -gt 90) { Write-Warning 'The System Log keeps 90 days; using 90.'; $LookbackDays = 90 }
+$cutoffIso = [datetime]::UtcNow.AddDays(-$LookbackDays).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 
 $apps = @(Get-OktaApps -Client $client)
 if ($Limit -gt 0 -and $apps.Count -gt $Limit) { $apps = $apps[0..($Limit - 1)] }
@@ -86,7 +90,8 @@ foreach ($a in $apps) { $appIds[$a.id] = $true }
 
 # One pass over System Log login events; tally per app id.
 $loginCounts = @{}
-$filter = 'eventType eq "user.authentication.sso" or eventType eq "user.session.start"'
+# user.session.start targets the user, not an app, so only SSO events count.
+$filter = 'eventType eq "user.authentication.sso"'
 $events = @(Get-OktaLogs -Client $client -Filter $filter -Since $cutoffIso)
 foreach ($e in $events) {
     foreach ($t in @($e.target)) {
@@ -119,52 +124,28 @@ foreach ($a in $apps) {
 }
 $waste = @($waste | Sort-Object -Property EstMonthlyWaste -Descending)
 
-# Duplicate identities: groups of 2+ on lowercased login or lowercased email.
-$byLogin = @{}
+# Shared email addresses among ACTIVE users.
 $byEmail = @{}
-$users = @(Get-OktaUsers -Client $client)
-foreach ($u in $users) {
-    $loginKey = "$($u.profile.login)".ToLower()
-    $emailKey = "$($u.profile.email)".ToLower()
-    if ($loginKey) {
-        if (-not $byLogin.ContainsKey($loginKey)) { $byLogin[$loginKey] = @() }
-        $byLogin[$loginKey] += $u.profile.login
-    }
-    if ($emailKey -and ($emailKey -ne $loginKey)) {
-        if (-not $byEmail.ContainsKey($emailKey)) { $byEmail[$emailKey] = @() }
-        $byEmail[$emailKey] += $u.profile.login
-    }
+foreach ($u in Get-OktaUsers -Client $client -Status 'ACTIVE') {
+    $emailKey = "$($u.profile.email)".ToLowerInvariant()
+    if (-not $emailKey) { continue }
+    if (-not $byEmail.ContainsKey($emailKey)) { $byEmail[$emailKey] = @() }
+    $byEmail[$emailKey] += [string]$u.profile.login
 }
-$dups = @()
-foreach ($key in $byLogin.Keys) {
-    if ($byLogin[$key].Count -ge 2) {
-        $dups += [pscustomobject]@{
-            Identity = $key
-            Type     = 'Login'
-            Count    = $byLogin[$key].Count
-            Logins   = ($byLogin[$key] -join '; ')
-        }
-    }
-}
-foreach ($key in $byEmail.Keys) {
+$dups = @(foreach ($key in $byEmail.Keys) {
     if ($byEmail[$key].Count -ge 2) {
-        $dups += [pscustomobject]@{
-            Identity = $key
-            Type     = 'Email'
-            Count    = $byEmail[$key].Count
-            Logins   = ($byEmail[$key] -join '; ')
-        }
+        [pscustomobject]@{ Email = $key; Count = $byEmail[$key].Count; Logins = ($byEmail[$key] -join '; ') }
     }
-}
+})
 
 if ($Json) {
     $payload = [pscustomobject]@{ Waste = $waste; Duplicates = $dups } | ConvertTo-Json -Depth 10
     if ($payload) { Write-Output $payload }
     if ($Output) { $payload | Out-File -FilePath $Output -Encoding utf8 }
 } else {
-    $waste | Format-Table -AutoSize
+    $waste | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
     Write-Output ''
-    Write-Output 'Duplicate identities:'
-    $dups | Format-Table -AutoSize
-    if ($Output) { $waste | Export-Csv -Path $Output -NoTypeInformation -Encoding utf8 }
+    Write-Output 'Active users sharing an email address:'
+    $dups | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
+    if ($Output) { $waste | Export-OktaCsv -Path $Output }
 }

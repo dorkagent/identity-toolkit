@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+# reports and snapshots the scripts write by default; they contain tenant data
+snapshots/
+review-packs-*/
+token-report-*/

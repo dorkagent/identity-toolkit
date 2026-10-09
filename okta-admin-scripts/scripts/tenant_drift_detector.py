@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Tenant drift detector (DHQ-89).
+"""Snapshot Okta tenant configuration and diff two snapshots.
 
-Captures point-in-time snapshots of tenant configuration (policies + rules,
-network zones, authorization servers, apps + assignments, admin role grants)
-and diffs two snapshots to show configuration drift.
+A snapshot holds policies and their rules (global session, app sign-in,
+password, authenticator enrollment, IdP discovery), network zones,
+authorization servers, apps with their assigned user IDs, and admin role
+assignments. Diffs ignore fields that change on their own (created,
+lastUpdated, _links, lastLogin, statusChanged, passwordChanged).
 
-Usage:
-    export OKTA_DOMAIN=https://dev-123456.okta.com
-    export OKTA_API_TOKEN=00...
-    python scripts/python/tenant_drift_detector.py --snapshot
-    python scripts/python/tenant_drift_detector.py --list
-    python scripts/python/tenant_drift_detector.py --diff snap-old.json snap-new.json
-    python scripts/python/tenant_drift_detector.py --diff snap-old.json snap-new.json --json --output drift.json
+Snapshots are written with mode 0600; they contain your full policy setup.
+The PowerShell Tenant-DriftDetector.ps1 writes a different snapshot format,
+so don't diff one against the other.
 
-Volatile fields (created, lastUpdated, _links, lastLogin, statusChanged,
-passwordChanged) are ignored recursively when diffing, so only real
-configuration drift shows up.
+Examples:
+    python scripts/tenant_drift_detector.py --snapshot
+    python scripts/tenant_drift_detector.py --list
+    python scripts/tenant_drift_detector.py --diff old.json new.json
+    python scripts/tenant_drift_detector.py --diff old.json new.json --json --output drift.json
 """
 
 from __future__ import annotations
@@ -25,16 +25,19 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.okta_client import OktaClient, OktaAuthError
+from lib.common import connect
+from lib.okta_client import OktaApiError, OktaClient
+from lib.output import emit, write_private
 
 VOLATILE_FIELDS = {"created", "lastUpdated", "_links", "lastLogin",
                    "statusChanged", "passwordChanged"}
 
-POLICY_TYPES = ["OKTA_SIGN_ON", "PASSWORD", "MFA_ENROLL", "IDP_DISCOVERY"]
+# ACCESS_POLICY exists only on Identity Engine orgs; Classic orgs reject it.
+POLICY_TYPES = ["OKTA_SIGN_ON", "ACCESS_POLICY", "PASSWORD", "MFA_ENROLL", "IDP_DISCOVERY"]
 
 # group -> (key function, display-name function)
 GROUP_KEYS = {
@@ -42,7 +45,8 @@ GROUP_KEYS = {
     "zones": (lambda r: r.get("id"), lambda r: r.get("name") or "?"),
     "auth_servers": (lambda r: r.get("id"), lambda r: r.get("name") or "?"),
     "apps": (lambda r: r.get("id"), lambda r: r.get("label") or "?"),
-    "admin_roles": (lambda r: f"{r.get('user_id')}::{r.get('role_type')}",
+    "admin_roles": (lambda r: f"{r.get('user_id')}::{r.get('role_type')}::{r.get('label')}"
+                    f"::{r.get('assignment_type')}",
                     lambda r: f"{r.get('login')} / {r.get('role_type')}"),
 }
 
@@ -71,7 +75,12 @@ def capture_snapshot(client: OktaClient) -> dict:
     policies = []
     for ptype in POLICY_TYPES:
         n = 0
-        for policy in client.list_policies(ptype):
+        try:
+            found = list(client.list_policies(ptype))
+        except OktaApiError as e:
+            print(f"... skipped {ptype}: {e.status}", file=sys.stderr)
+            continue
+        for policy in found:
             n += 1
             rules = []
             for rule in client.list_policy_rules(policy["id"]):
@@ -111,26 +120,27 @@ def capture_snapshot(client: OktaClient) -> dict:
     print(f"... captured {len(apps)} apps", file=sys.stderr)
 
     admin_roles = []
-    n_users = 0
-    for user in client.list_users():
-        n_users += 1
-        login = (user.get("profile") or {}).get("login")
-        for role in client.list_user_roles(user["id"]):
+    holders = client.list_role_assignee_user_ids()
+    for uid in holders:
+        login = ((client.get(f"/api/v1/users/{uid}") or {}).get("profile") or {}).get("login")
+        for role in client.list_user_roles(uid):
             admin_roles.append({
-                "user_id": user.get("id"),
+                "user_id": uid,
                 "login": login,
                 "role_type": role.get("type"),
+                "label": role.get("label"),
+                "assignment_type": role.get("assignmentType"),
                 "grant_date": role.get("created"),
             })
     print(f"... captured {len(admin_roles)} admin role grants "
-          f"({n_users} users)", file=sys.stderr)
+          f"({len(holders)} holders)", file=sys.stderr)
 
     return {
         "meta": {
             "domain": client.base_url,
-            "snapshot_id": datetime.now(timezone.utc)
+            "snapshot_id": datetime.now(UTC)
                 .strftime("%Y%m%d-%H%M%S"),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "script": "tenant_drift_detector.py",
         },
         "data": {
@@ -203,25 +213,25 @@ def _short(value) -> str:
     return s if len(s) <= 90 else s[:87] + "..."
 
 
-def print_diff(diff: dict):
+def render_diff(diff: dict) -> str:
+    lines = []
     for group, (key_fn, name_fn) in GROUP_KEYS.items():
         sect = diff[group]
         n_add, n_rem, n_chg = (len(sect["added"]), len(sect["removed"]),
                                len(sect["changed"]))
-        print(f"\n=== {group} "
-              f"(+{n_add} -{n_rem} ~{n_chg}) ===")
+        lines.append(f"\n=== {group} (+{n_add} -{n_rem} ~{n_chg}) ===")
         for r in sect["added"]:
-            print(f"+ {name_fn(r)}  [id={key_fn(r)}]")
+            lines.append(f"+ {name_fn(r)}  [id={key_fn(r)}]")
         for r in sect["removed"]:
-            print(f"- {name_fn(r)}  [id={key_fn(r)}]")
+            lines.append(f"- {name_fn(r)}  [id={key_fn(r)}]")
         for c in sect["changed"]:
-            print(f"~ {name_fn(c['resource'])}  [id={c['key']}]")
+            lines.append(f"~ {name_fn(c['resource'])}  [id={c['key']}]")
             for ch in c["changes"]:
-                print(f"    {ch['path']}: {_short(ch['old'])} "
-                      f"-> {_short(ch['new'])}")
+                lines.append(f"    {ch['path']}: {_short(ch['old'])} -> {_short(ch['new'])}")
     total = sum(len(diff[g][k]) for g in diff for k in ("added", "removed",
                                                        "changed"))
-    print(f"\ntotal changes: {total}")
+    lines.append(f"\ntotal changes: {total}")
+    return "\n".join(lines)
 
 
 def resolve_path(p: str, snapshot_dir: str) -> str:
@@ -250,7 +260,7 @@ def cmd_list(snapshot_dir: str):
         print(f"{f[:60]:60} {str(ts)[:28]:28} {domain}")
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(
         description="Capture Okta tenant config snapshots and diff them "
                     "to show configuration drift.")
@@ -265,7 +275,7 @@ def main():
     p.add_argument("--json", action="store_true",
                    help="emit JSON instead of a human-readable diff")
     p.add_argument("--output", default=None, help="write report to file")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     actions = [args.snapshot, bool(args.diff), args.list]
     if sum(actions) != 1:
@@ -285,32 +295,16 @@ def main():
         with open(new_path, encoding="utf-8") as f:
             new = json.load(f)
         diff = diff_snapshots(old, new)
-        if args.json:
-            report = json.dumps(diff, indent=2, default=str)
-        else:
-            print_diff(diff)
-            report = ""
-        if args.output:
-            with open(args.output, "w", encoding="utf-8") as f:
-                f.write(report if args.json else "")
-            print(f"\nwrote {args.output}", file=sys.stderr)
-        elif args.json:
-            print(report)
+        emit(report=diff, text=render_diff(diff), as_json=args.json, output=args.output)
         return
 
     # --snapshot
-    try:
-        client = OktaClient()
-    except OktaAuthError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
-
+    client = connect()
     snap = capture_snapshot(client)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     filename = f"{slugify(client.base_url)}-{stamp}.json"
     path = os.path.join(args.snapshot_dir, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(snap, f, indent=2, default=str)
+    write_private(path, json.dumps(snap, indent=2, default=str))
     print(f"snapshot written to {path}", file=sys.stderr)
 
 

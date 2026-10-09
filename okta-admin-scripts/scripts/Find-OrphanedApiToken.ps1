@@ -1,27 +1,30 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Finds orphaned and privileged Okta API tokens (owner-correlation audit).
 
 .DESCRIPTION
-    Okta's Tokens page already shows each token's age, expiry, and last use --
-    but it won't tell you whether the human behind the token is still
-    employed, or what admin privileges that human holds. This script closes
-    that gap: it lists every API token, resolves the token's owner, and
-    reports the owner's lifecycle state (active/suspended/deprovisioned), the
-    owner's admin roles, and last use.
+    Lists every active API token, looks up its owner, and reports the
+    owner's status and admin roles. The Tokens page in the Admin Console
+    shows age and expiry but not who is behind each token or what they can do.
 
     Flagged findings:
-      OwnerGone          -- the owner's user record is gone (lookup 404s).
-      OwnerDeprovisioned -- the owner is in DEPROVISIONED status.
-      OwnerSuspended     -- the owner is in SUSPENDED status.
-      PrivilegedOwner    -- the owner holds at least one admin role
-                            (role types are listed).
+      OwnerSuspended     the owner is SUSPENDED but the token still works.
+      PrivilegedOwner    the owner holds at least one admin role (listed).
+      OwnerDeprovisioned the owner is DEPROVISIONED.
+      OwnerGone          the owner's user record can't be found.
+
+    The last two should be rare: Okta revokes a user's tokens when the user
+    is deactivated, and the list endpoint only returns active tokens.
+
+    LastUpdated is shown as-is; it is not a last-used time. Okta expires a
+    token 30 days after its last use, so ExpiresAt minus 30 days is the best
+    available "last used" signal.
 
     GET /api/v1/api-tokens requires a SUPER-ADMIN API token; ordinary
     read-only tokens are rejected with 401/403 and the script says so.
 
-    READ-ONLY: every HTTP call is a GET. The script never changes anything
-    in the tenant. Findings are revocation candidates, not revocations.
+    Read-only: every call is a GET. Findings are candidates to revoke, not revocations.
 
 .PARAMETER OutputDir
     Directory for the timestamped evidence pack. Defaults to
@@ -70,12 +73,12 @@ function Get-OktaUserOrNull {
     }
 }
 
-# Token listing needs a super-admin token -- say so plainly on 401/403.
+# Token listing needs a super-admin token; say so plainly on 401/403.
 try {
     $tokens = @(Invoke-OktaPagedGet -Client $client -Path '/api/v1/api-tokens')
 } catch {
     if ("$($_.Exception.Message)" -match 'HTTP 40[13]') {
-        throw "GET /api/v1/api-tokens was rejected ($($_.Exception.Message)). This endpoint requires a SUPER-ADMIN API token -- ordinary read-only tokens cannot list API tokens."
+        throw "GET /api/v1/api-tokens was rejected ($($_.Exception.Message)). This endpoint requires a SUPER-ADMIN API token; ordinary read-only tokens cannot list API tokens."
     }
     throw
 }
@@ -123,7 +126,7 @@ foreach ($token in $tokens) {
         OwnerRoles  = ($roleTypes -join '; ')
         Created     = $token.created
         ExpiresAt   = $token.expiresAt
-        LastUsed    = $token.lastUpdated
+        LastUpdated = $token.lastUpdated
         Flags       = ($flags -join '; ')
     }
 }
@@ -140,21 +143,20 @@ if (-not $OutputDir) {
 }
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 $csvPath = Join-Path $OutputDir 'tokens.csv'
-$rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding utf8
+$rows | Export-OktaCsv -Path $csvPath
 
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $md = @()
-$md += '# Exhibit: Orphaned and privileged Okta API tokens'
+$md += '# Okta API tokens: owner status and privileges'
 $md += ''
 $md += "Tenant: $($client.BaseUrl)"
 $md += "Generated: $stamp (UTC)"
 $md += "Tokens examined: $($rows.Count)"
 $md += "Tokens flagged: $($flagged.Count)"
 $md += ''
-$md += '> Okta''s Tokens page reports age, expiry, and last use -- this exhibit'
-$md += '> answers the two questions it cannot: is the token''s owner still'
-$md += '> employed, and what admin privileges does the owner hold? Every API'
-$md += '> call made to produce this report was a read-only GET.'
+$md += '> For each active API token: who owns it, whether that account is'
+$md += '> still active, and which admin roles it holds. Every call made to'
+$md += '> produce this report was a GET.'
 $md += ''
 $md += '## Finding counts'
 $md += ''
@@ -168,36 +170,34 @@ $md += '## Flagged tokens'
 $md += ''
 if ($flagged.Count -eq 0) {
     $md += 'No flagged tokens. Every API token is owned by an active,'
-    $md += 'non-privileged user -- or no tokens exist in the tenant.'
+    $md += 'non-privileged user; or no tokens exist in the tenant.'
 } else {
     foreach ($row in $flagged) {
         $md += "### Token '$($row.TokenName)' [$($row.TokenId)]"
         $md += ''
-        $md += "- Owner: $(if ($row.OwnerLogin) { $row.OwnerLogin } else { '(unknown -- owner record unavailable)' }) (status: $($row.OwnerStatus))"
+        $md += "- Owner: $(if ($row.OwnerLogin) { $row.OwnerLogin } else { '(unknown; owner record unavailable)' }) (status: $($row.OwnerStatus))"
         $md += "- Owner admin roles: $(if ($row.OwnerRoles) { $row.OwnerRoles } else { 'none' })"
-        $md += "- Last used: $(if ($row.LastUsed) { $row.LastUsed } else { 'never recorded' })"
+        $md += "- Last updated: $(if ($row.LastUpdated) { $row.LastUpdated } else { 'not recorded' })"
         $md += "- Expires: $(if ($row.ExpiresAt) { $row.ExpiresAt } else { 'no expiry set' })"
         foreach ($flag in ($row.Flags -split '; ')) {
             switch ($flag.Trim()) {
-                'OwnerGone'          { $md += "- FINDING: the owner's user record is gone (or no owner is recorded on the token). This token has no living owner -- revoke it after confirming no service depends on it." }
-                'OwnerDeprovisioned' { $md += "- FINDING: the owner is DEPROVISIONED (no longer employed / offboarded). A token can outlive its owner's employment -- verify and revoke." }
-                'OwnerSuspended'     { $md += "- FINDING: the owner is SUSPENDED. A live token on a suspended account is a backdoor -- verify and revoke." }
+                'OwnerGone'          { $md += "- FINDING: the owner's user record is gone (or no owner is recorded on the token). This token has no living owner; revoke it after confirming no service depends on it." }
+                'OwnerDeprovisioned' { $md += "- FINDING: the owner is DEPROVISIONED (no longer employed / offboarded). Okta normally revokes tokens on deactivation, so check how this one survived, then revoke it." }
+                'OwnerSuspended'     { $md += "- FINDING: the owner is SUSPENDED. The token still works while the account is suspended. Confirm whether it is needed, then revoke it." }
                 'PrivilegedOwner'    { $md += "- NOTE: the owner holds admin role(s) ($($row.OwnerRoles)). Confirm this level of standing access is still warranted." }
             }
         }
         $md += ''
     }
 }
-$md += '## What this exhibit does not do'
+$md += '## What this report does not do'
 $md += ''
-$md += '- Nothing here was revoked, disabled, or changed -- the report is'
-$md += '  strictly read-only. Revoke candidates in Okta Admin Console'
+$md += '- Nothing here was revoked, disabled, or changed. Revoke'
+$md += '  candidates in the Okta Admin Console'
 $md += '  (Settings > API > Tokens) after confirming no service depends'
 $md += '  on the token.'
-$md += '- Token age, expiry, and last use are already shown on Okta''s native'
-$md += '  Tokens page and are repeated here only for context. "Last used" is'
-$md += '  sourced from the token''s lastUpdated timestamp -- the only usage'
-$md += '  signal the API exposes on the token object.'
+$md += '- The API has no last-used field. Tokens expire 30 days after their'
+$md += '  last use, so ExpiresAt minus 30 days approximates it.'
 $summaryPath = Join-Path $OutputDir 'SUMMARY.md'
 $md -join [Environment]::NewLine | Out-File -FilePath $summaryPath -Encoding utf8
 
@@ -211,7 +211,7 @@ if ($Json) {
         Write-Output ''
         Write-Output 'Flagged tokens:'
         $flagged |
-            Select-Object TokenName, OwnerLogin, OwnerStatus, OwnerRoles, LastUsed, Flags |
+            Select-Object TokenName, OwnerLogin, OwnerStatus, OwnerRoles, ExpiresAt, Flags |
             Format-Table -AutoSize |
             Out-String -Width 200 |
             Write-Output

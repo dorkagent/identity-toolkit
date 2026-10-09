@@ -1,13 +1,14 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Audits all Okta group rules for rot: broken, conflicting, or dead rules (read-only).
 
 .DESCRIPTION
-    READ-ONLY. Enumerates every group rule (GET /api/v1/groups/rules) and flags:
+    Read-only. Enumerates every group rule (GET /api/v1/groups/rules) and flags:
       - InactiveRule:      status is INACTIVE (rule never evaluates).
       - InvalidRule:       status is INVALID (Okta cannot evaluate it).
       - EmptyExpression:   conditions.expression.value is missing or blank.
-      - SuspiciousExpression: heuristic only -- unbalanced quotes or
+      - SuspiciousExpression: heuristic only; unbalanced quotes or
         parentheses in the expression. Labeled as heuristic in Evidence.
       - DeletedTargetGroup: a target group id 404s (the group was deleted after
         the rule was created). Each group lookup is isolated in try/catch so one
@@ -19,22 +20,23 @@
         group; Evidence lists the sibling rules.
 
     With -ImpactPreview the script adds a MembersAtRisk column: the member count
-    of each ACTIVE rule's target groups -- the rule's current blast radius, i.e.
-    the people whose group access flows through the groups the rule feeds.
-    Counts are summed across the rule's target groups, so a user who sits in
-    two target groups counts twice. Rows are blast-radius ordered -- highest
-    MembersAtRisk first, then by number of flags -- so the riskiest rules
-    surface at the top.
+    of each ACTIVE rule's target groups: roughly how many people a change to
+    the rule would affect. Counts are summed across target groups, so a user
+    in two target groups counts twice. Rows are ordered by MembersAtRisk,
+    then by number of flags.
 
-    Zero browser dependency; every HTTP call is a GET. Nothing in the tenant
-    is changed.
+    Every call is a GET.
+
+    Known gaps: ConflictingTargets also fires on the normal pattern of
+    several rules feeding one group, and group IDs referenced inside rule
+    expressions (isMemberOfAnyGroup("00g...")) are not checked yet.
 
 .PARAMETER Limit
     Maximum number of group rules to audit. 0 (default) means all rules.
 
 .PARAMETER ImpactPreview
     Add a MembersAtRisk column showing the member count of each ACTIVE rule's
-    target groups, and order rows by blast radius (highest risk first).
+    target groups, and order rows by it.
 
 .PARAMETER Json
     Emit the report as JSON instead of a table.
@@ -49,7 +51,7 @@
 
 .EXAMPLE
     pwsh ./Test-GroupRule.ps1 -ImpactPreview
-    Adds the MembersAtRisk column and orders by blast radius.
+    Adds the MembersAtRisk column and orders by it.
 
 .EXAMPLE
     pwsh ./Test-GroupRule.ps1 -Json -Output rules.json
@@ -111,7 +113,7 @@ foreach ($rule in $rules) {
         $evidence += 'conditions.expression.value is missing or blank.'
     } else {
         # Heuristic: unbalanced quotes or parentheses. Okta EL escapes quotes
-        # as \", so strip those before counting. Never conclusive -- labeled as
+        # as \", so strip those before counting. Never conclusive; labeled as
         # heuristic in the Evidence column.
         $quoteStripped = $expr -replace '\\"', ''
         $dbl = ([regex]::Matches($quoteStripped, '"')).Count
@@ -120,7 +122,7 @@ foreach ($rule in $rules) {
         $close = ([regex]::Matches($expr, '\)')).Count
         if (($dbl % 2) -ne 0 -or ($sgl % 2) -ne 0 -or $open -ne $close) {
             $flags += 'SuspiciousExpression'
-            $evidence += 'heuristic: expression has unbalanced quotes or parentheses -- review manually.'
+            $evidence += 'heuristic: expression has unbalanced quotes or parentheses; review manually.'
         }
     }
 
@@ -287,8 +289,10 @@ if ($Json) {
     if ($payload) { Write-Output $payload }
     if ($Output) { $payload | Out-File -FilePath $Output -Encoding utf8 }
 } elseif ($Output) {
-    $rows | Export-Csv -Path $Output -NoTypeInformation -Encoding utf8
+    $rows | Export-OktaCsv -Path $Output
     Write-Output "Wrote $($rows.Count) rule(s) to $Output"
+} elseif ($rows.Count -eq 0) {
+    Write-Output 'No group rules found.'
 } else {
-    $rows | Format-Table -AutoSize
+    $rows | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Output
 }

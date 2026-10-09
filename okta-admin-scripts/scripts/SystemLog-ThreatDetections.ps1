@@ -1,312 +1,210 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Detects authentication threats in the Okta System Log: impossible travel,
-    MFA fatigue, and session/token anomalies.
+    A few simple detections over the Okta System Log (read-only).
 
 .DESCRIPTION
-    Read-only. Scans the System Log over -LookbackHours and runs three detectors:
+    Same detections as system_log_threat_detections.py:
 
-    (a) Impossible travel: user.session.start events grouped per user and sorted
-        by time. For consecutive events carrying geolocation
-        ($e.client.geographicalContext.geolocation), the haversine distance
-        divided by elapsed hours gives an implied travel speed; speeds above
-        -MaxSpeed (default 900 km/h) are flagged with the cities and timestamps.
+    ImpossibleTravel
+        Successful user.session.start events per user in time order. Two
+        sign-ins more than -MinDistanceKm apart with an implied speed above
+        -MaxSpeed are flagged. Proxy traffic (securityContext.isProxy) is
+        skipped and gaps under a minute count as a minute.
 
-    (b) MFA fatigue: events of type -MfaEvent (default
-        "user.authentication.auth_via_mfa") grouped per user. A sliding window
-        of -FatigueWindowMinutes (default 15) containing at least
-        -FatigueThreshold (default 10) attempts is flagged. Also flags a
-        denied-then-approved pattern (outcome.result FAILURE followed by
-        SUCCESS within the same window) for the same user.
+    PushFatigue
+        -PushThreshold or more Okta Verify pushes sent to one user
+        (system.push.send_factor_verify_push) within -WindowMinutes.
 
-    (c) Token replay / session anomalies: the session id is taken from
-        $e.target[0].id on session-start events. Flags a session id seen from
-        2+ distinct IPs, or from geolocations more than -MinDistanceKm
-        (default 500) apart. Also flags concurrent sessions for the same user:
-        events from different session ids within -ConcurrencyWindowMinutes
-        (default 60) whose geolocations are more than -MinDistanceKm apart.
+    MfaDeniedThenApproved
+        -DenyThreshold or more MFA failures, then a success, inside the window.
+        Failures are user.mfa.okta_verify.deny_push (Classic) and
+        user.authentication.auth_via_mfa with outcome FAILURE (Identity
+        Engine, where a mistyped code also counts).
 
-    NOTE: Okta Verify / push event types vary by org version; the exact event
-    type for MFA challenges may differ on your tenant. Use -MfaEvent to override
-    the event type used for detector (b).
-
-    Findings table: Time, User, Type, Detail, Severity. -Json for
-    machine-readable output; -Output writes the report to a file. Requires
-    OKTA_DOMAIN and OKTA_API_TOKEN environment variables. Secrets are never
-    hardcoded.
+    SessionIpChange
+        One Okta session (authenticationContext.externalSessionId) seen from
+        two or more IPs across user.session.start and user.authentication.sso.
+        High when the locations are more than -MinDistanceKm apart, else Low.
 
 .PARAMETER LookbackHours
-    How many hours back to scan the System Log. Default 24.
+    Hours of System Log to scan. Default 24.
 
 .PARAMETER MaxSpeed
-    Implied travel speed (km/h) above which a consecutive event pair is
-    flagged as impossible travel. Default 900.
-
-.PARAMETER MfaEvent
-    System Log event type used for MFA challenge detection. Default
-    "user.authentication.auth_via_mfa". Override this if your org version
-    emits Okta Verify / push events under a different type.
-
-.PARAMETER FatigueWindowMinutes
-    Sliding-window size in minutes for MFA fatigue detection. Default 15.
-
-.PARAMETER FatigueThreshold
-    Number of MFA attempts within the fatigue window that triggers a flag.
-    Default 10.
+    km/h. Default 900.
 
 .PARAMETER MinDistanceKm
-    Minimum haversine distance (km) between geolocations that counts as
-    "distant" for session anomaly detection. Default 500.
+    Location changes shorter than this are ignored for travel. Default 500.
 
-.PARAMETER ConcurrencyWindowMinutes
-    Time window in minutes used to detect concurrent distant sessions for
-    the same user. Default 60.
+.PARAMETER WindowMinutes
+    Window for the MFA detections. Default 15.
+
+.PARAMETER PushThreshold
+    Pushes in the window that count as fatigue. Default 5.
+
+.PARAMETER DenyThreshold
+    MFA failures before a success that get flagged. Default 3.
 
 .PARAMETER Json
-    Emit the findings as JSON instead of a table.
+    Print JSON instead of a table.
 
 .PARAMETER Output
-    Write the report to this file path as well as displaying it.
+    Also write the findings to this file (JSON with -Json, otherwise CSV).
 
 .EXAMPLE
-    .\SystemLog-ThreatDetections.ps1
-    Run all detectors over the last 24 hours of System Log events.
-
-.EXAMPLE
-    .\SystemLog-ThreatDetections.ps1 -LookbackHours 72 -MfaEvent "user.authentication.auth_via_push" -Json -Output .\threats.json
-    Scan 72 hours using a custom MFA event type, save findings as JSON.
+    ./SystemLog-ThreatDetections.ps1 -LookbackHours 72 -Json -Output ./threats.json
 #>
-
 [CmdletBinding()]
 param(
     [int]$LookbackHours = 24,
     [double]$MaxSpeed = 900,
-    [string]$MfaEvent = "user.authentication.auth_via_mfa",
-    [int]$FatigueWindowMinutes = 15,
-    [int]$FatigueThreshold = 10,
     [double]$MinDistanceKm = 500,
-    [int]$ConcurrencyWindowMinutes = 60,
+    [int]$WindowMinutes = 15,
+    [int]$PushThreshold = 5,
+    [int]$DenyThreshold = 3,
     [switch]$Json,
     [string]$Output
 )
 
 Import-Module "$PSScriptRoot/../lib/OktaClient.psm1" -Force
+$ErrorActionPreference = 'Stop'
 $client = New-OktaClient
 
 function Get-HaversineKm {
     param([double]$Lat1, [double]$Lon1, [double]$Lat2, [double]$Lon2)
     $rad = [Math]::PI / 180.0
-    $dLat = ($Lat2 - $Lat1) * $rad
-    $dLon = ($Lon2 - $Lon1) * $rad
-    $sinLat = [Math]::Sin($dLat / 2)
-    $sinLon = [Math]::Sin($dLon / 2)
-    $a = ($sinLat * $sinLat) + ([Math]::Cos($Lat1 * $rad) * [Math]::Cos($Lat2 * $rad) * $sinLon * $sinLon)
-    $c = 2 * [Math]::Atan2([Math]::Sqrt($a), [Math]::Sqrt(1 - $a))
-    return 6371.0 * $c
+    $a = [Math]::Pow([Math]::Sin(($Lat2 - $Lat1) * $rad / 2), 2) +
+         [Math]::Cos($Lat1 * $rad) * [Math]::Cos($Lat2 * $rad) * [Math]::Pow([Math]::Sin(($Lon2 - $Lon1) * $rad / 2), 2)
+    return 2 * 6371.0 * [Math]::Asin([Math]::Sqrt($a))
 }
 
 function Get-GeoPoint {
     param($LogEvent)
-    $g = $LogEvent.client.geographicalContext.geolocation
-    if ($null -eq $g) { return $null }
-    if ($null -eq $g.lat -or $null -eq $g.lon) { return $null }
-    return [pscustomobject]@{
-        Lat     = [double]$g.lat
-        Lon     = [double]$g.lon
-        City    = [string]$g.city
-        Country = [string]$g.country
+    $gc = $LogEvent.client.geographicalContext
+    if ($null -eq $gc -or $null -eq $gc.geolocation -or $null -eq $gc.geolocation.lat -or $null -eq $gc.geolocation.lon) { return $null }
+    [pscustomobject]@{ Lat = [double]$gc.geolocation.lat; Lon = [double]$gc.geolocation.lon; City = [string]$gc.city; Country = [string]$gc.country }
+}
+
+function Get-EventUser {
+    # The user an event is about: the actor if it's a User, else the first User target.
+    param($LogEvent)
+    if (-not $LogEvent.actor.type -or $LogEvent.actor.type -eq 'User') { return $LogEvent.actor }
+    $t = @($LogEvent.target) | Where-Object { $_.type -eq 'User' } | Select-Object -First 1
+    if ($t) { return $t }
+    return $LogEvent.actor
+}
+
+function Get-EventTime { param($LogEvent) ConvertTo-OktaUtcDate $LogEvent.published }
+
+function Group-ByUser {
+    param($LogEvents)
+    $map = @{}
+    foreach ($e in $LogEvents) {
+        $uid = [string](Get-EventUser $e).id
+        if (-not $uid) { continue }
+        if (-not $map.ContainsKey($uid)) { $map[$uid] = [System.Collections.Generic.List[object]]::new() }
+        $map[$uid].Add($e)
     }
+    foreach ($k in @($map.Keys)) { $map[$k] = @($map[$k] | Sort-Object { Get-EventTime $_ }) }
+    return $map
 }
 
-function Get-EventLogin {
-    param($LogEvent)
-    $login = [string]$LogEvent.actor.alternateId
-    if (-not $login) { $login = [string]$LogEvent.actor.id }
-    return $login
-}
-
-function Get-SessionId {
-    param($LogEvent)
-    $t0 = @($LogEvent.target)[0]
-    if ($null -eq $t0) { return "" }
-    return [string]$t0.id
-}
-
-$findings = New-Object System.Collections.ArrayList
+$findings = [System.Collections.Generic.List[object]]::new()
 function Add-Finding {
-    param([datetime]$Time, [string]$User, [string]$Type, [string]$Detail, [string]$Severity)
-    [void]$script:findings.Add([pscustomobject]@{
-        Time     = $Time
-        User     = $User
-        Type     = $Type
-        Detail   = $Detail
-        Severity = $Severity
-    })
+    param($LogEvent, [string]$Type, [string]$Severity, [string]$Detail)
+    $u = Get-EventUser $LogEvent
+    $name = if ($u.alternateId) { [string]$u.alternateId } else { [string]$u.id }
+    $script:findings.Add([pscustomobject]@{ Time = (ConvertTo-OktaIsoString $LogEvent.published); User = $name; Type = $Type; Severity = $Severity; Detail = $Detail })
 }
 
-$cutoff = (Get-Date).ToUniversalTime().AddHours(-$LookbackHours).ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$since = [datetime]::UtcNow.AddHours(-$LookbackHours).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+$types = 'user.session.start', 'user.authentication.sso', 'system.push.send_factor_verify_push', 'user.mfa.okta_verify.deny_push', 'user.authentication.auth_via_mfa'
+$filter = ($types | ForEach-Object { "eventType eq `"$_`"" }) -join ' or '
+$events = @(Get-OktaLogs -Client $client -Filter $filter -Since $since)
+$window = [TimeSpan]::FromMinutes($WindowMinutes)
 
-# --- (a) Impossible travel ----------------------------------------------------
-$sessionEvents = @(Get-OktaLogs -Client $client -Filter 'eventType eq "user.session.start"' -Since $cutoff)
-
-$byUser = @{}
-foreach ($e in $sessionEvents) {
-    $login = Get-EventLogin $e
-    if (-not $byUser.ContainsKey($login)) { $byUser[$login] = New-Object System.Collections.ArrayList }
-    [void]$byUser[$login].Add($e)
-}
-
-foreach ($login in $byUser.Keys) {
-    $list = @($byUser[$login] | Sort-Object -Property { [datetime]$_.published })
+# Impossible travel
+$signIns = @($events | Where-Object {
+    $_.eventType -eq 'user.session.start' -and $_.outcome.result -eq 'SUCCESS' -and -not $_.securityContext.isProxy -and (Get-GeoPoint $_)
+})
+$byUser = Group-ByUser $signIns
+foreach ($list in $byUser.Values) {
     for ($i = 1; $i -lt $list.Count; $i++) {
-        $prev = $list[$i - 1]
-        $cur = $list[$i]
-        $g1 = Get-GeoPoint $prev
-        $g2 = Get-GeoPoint $cur
-        if ($null -eq $g1 -or $null -eq $g2) { continue }
-        $t1 = [datetime]$prev.published
-        $t2 = [datetime]$cur.published
-        $hours = ($t2 - $t1).TotalHours
-        if ($hours -le 0) { continue }
-        $km = Get-HaversineKm -Lat1 $g1.Lat -Lon1 $g1.Lon -Lat2 $g2.Lat -Lon2 $g2.Lon
+        $g1 = Get-GeoPoint $list[$i - 1]; $g2 = Get-GeoPoint $list[$i]
+        $km = Get-HaversineKm $g1.Lat $g1.Lon $g2.Lat $g2.Lon
+        if ($km -lt $MinDistanceKm) { continue }
+        $hours = [Math]::Max(((Get-EventTime $list[$i]) - (Get-EventTime $list[$i - 1])).TotalSeconds, 60) / 3600
         $speed = $km / $hours
         if ($speed -gt $MaxSpeed) {
-            $detail = "{0} -> {1}: {2:N0} km in {3:N1}h (implied {4:N0} km/h, limit {5:N0})" -f $g1.City, $g2.City, $km, $hours, $speed, $MaxSpeed
-            Add-Finding -Time $t2 -User $login -Type "ImpossibleTravel" -Detail $detail -Severity "High"
+            Add-Finding $list[$i] 'ImpossibleTravel' 'High' ('{0:N0} km in {1:N2} h ({2:N0} km/h): {3}, {4} -> {5}, {6}' -f $km, $hours, $speed, $g1.City, $g1.Country, $g2.City, $g2.Country)
         }
     }
 }
 
-# --- (b) MFA fatigue ----------------------------------------------------------
-$mfaEvents = @(Get-OktaLogs -Client $client -Filter "eventType eq `"$MfaEvent`"" -Since $cutoff)
-
-$byMfaUser = @{}
-foreach ($e in $mfaEvents) {
-    $login = Get-EventLogin $e
-    if (-not $byMfaUser.ContainsKey($login)) { $byMfaUser[$login] = New-Object System.Collections.ArrayList }
-    [void]$byMfaUser[$login].Add($e)
-}
-
-$fatigueWindow = [TimeSpan]::FromMinutes($FatigueWindowMinutes)
-foreach ($login in $byMfaUser.Keys) {
-    $list = @($byMfaUser[$login] | Sort-Object -Property { [datetime]$_.published })
-    $times = @()
-    foreach ($e in $list) { $times += [datetime]$e.published }
-
-    # Sliding window: >= threshold attempts within the window
-    $flagged = $false
-    for ($i = 0; $i -lt $times.Count -and -not $flagged; $i++) {
-        $count = 0
-        for ($j = $i; $j -lt $times.Count; $j++) {
-            if (($times[$j] - $times[$i]) -le $fatigueWindow) { $count++ } else { break }
-        }
-        if ($count -ge $FatigueThreshold) {
-            $detail = "{0} MFA attempts within {1} minutes (threshold {2})" -f $count, $FatigueWindowMinutes, $FatigueThreshold
-            Add-Finding -Time $times[$i] -User $login -Type "MfaFatigue" -Detail $detail -Severity "High"
-            $flagged = $true
-        }
-    }
-
-    # Denied-then-approved: FAILURE followed by SUCCESS within the window
-    $deniedFlagged = $false
-    for ($i = 0; $i -lt $list.Count -and -not $deniedFlagged; $i++) {
-        if ([string]$list[$i].outcome.result -ne "FAILURE") { continue }
-        $tFail = [datetime]$list[$i].published
-        for ($k = $i + 1; $k -lt $list.Count; $k++) {
-            $tK = [datetime]$list[$k].published
-            if (($tK - $tFail) -gt $fatigueWindow) { break }
-            if ([string]$list[$k].outcome.result -eq "SUCCESS") {
-                $detail = "MFA denied at {0:u} then approved at {1:u} within {2} minutes" -f $tFail, $tK, $FatigueWindowMinutes
-                Add-Finding -Time $tK -User $login -Type "MfaDeniedThenApproved" -Detail $detail -Severity "Medium"
-                $deniedFlagged = $true
-                break
-            }
+# Push fatigue
+$byUser = Group-ByUser @($events | Where-Object { $_.eventType -eq 'system.push.send_factor_verify_push' })
+foreach ($list in $byUser.Values) {
+    $start = 0
+    for ($j = 0; $j -lt $list.Count; $j++) {
+        while (((Get-EventTime $list[$j]) - (Get-EventTime $list[$start])) -gt $window) { $start++ }
+        if ($j - $start + 1 -ge $PushThreshold) {
+            Add-Finding $list[$j] 'PushFatigue' 'High' ('{0} pushes sent in {1} min' -f ($j - $start + 1), $WindowMinutes)
+            break
         }
     }
 }
 
-# --- (c) Session / token anomalies --------------------------------------------
-$bySession = @{}
-foreach ($e in $sessionEvents) {
-    $sid = Get-SessionId $e
-    if (-not $sid) { continue }
-    if (-not $bySession.ContainsKey($sid)) { $bySession[$sid] = New-Object System.Collections.ArrayList }
-    [void]$bySession[$sid].Add($e)
-}
-
-foreach ($sid in $bySession.Keys) {
-    $list = @($bySession[$sid])
-    $login = Get-EventLogin $list[0]
-    $firstTime = [datetime]$list[0].published
-
-    # Same session id from 2+ distinct IPs
-    $ips = @{}
+# MFA denied then approved
+$byUser = Group-ByUser @($events | Where-Object { $_.eventType -in 'user.mfa.okta_verify.deny_push', 'user.authentication.auth_via_mfa' })
+foreach ($list in $byUser.Values) {
+    $failures = [System.Collections.Generic.List[datetime]]::new()
     foreach ($e in $list) {
-        $ip = [string]$e.client.ipAddress
-        if ($ip) { $ips[$ip] = $true }
-    }
-    if ($ips.Count -ge 2) {
-        $detail = "Session {0} seen from {1} distinct IPs: {2}" -f $sid, $ips.Count, (($ips.Keys | Sort-Object) -join ", ")
-        Add-Finding -Time $firstTime -User $login -Type "SessionIpReuse" -Detail $detail -Severity "Medium"
-    }
-
-    # Same session id from distant geolocations
-    $geos = @()
-    foreach ($e in $list) {
-        $g = Get-GeoPoint $e
-        if ($null -ne $g) { $geos += $g }
-    }
-    $maxDist = 0.0
-    for ($i = 0; $i -lt $geos.Count; $i++) {
-        for ($j = $i + 1; $j -lt $geos.Count; $j++) {
-            $d = Get-HaversineKm -Lat1 $geos[$i].Lat -Lon1 $geos[$i].Lon -Lat2 $geos[$j].Lat -Lon2 $geos[$j].Lon
-            if ($d -gt $maxDist) { $maxDist = $d }
-        }
-    }
-    if ($maxDist -gt $MinDistanceKm) {
-        $detail = "Session {0} used from locations {1:N0} km apart (threshold {2:N0} km)" -f $sid, $maxDist, $MinDistanceKm
-        Add-Finding -Time $firstTime -User $login -Type "SessionGeoSpread" -Detail $detail -Severity "Medium"
-    }
-}
-
-# Concurrent sessions: same user, different session ids, within the
-# concurrency window, from distant geolocations
-$concurrencyWindow = [TimeSpan]::FromMinutes($ConcurrencyWindowMinutes)
-foreach ($login in $byUser.Keys) {
-    $list = @($byUser[$login] | Sort-Object -Property { [datetime]$_.published })
-    $reported = $false
-    for ($i = 0; $i -lt $list.Count -and -not $reported; $i++) {
-        $gi = Get-GeoPoint $list[$i]
-        if ($null -eq $gi) { continue }
-        $si = Get-SessionId $list[$i]
-        $tI = [datetime]$list[$i].published
-        for ($k = $i + 1; $k -lt $list.Count; $k++) {
-            $tK = [datetime]$list[$k].published
-            if (($tK - $tI) -gt $concurrencyWindow) { break }
-            $sk = Get-SessionId $list[$k]
-            if ($sk -eq $si) { continue }
-            $gk = Get-GeoPoint $list[$k]
-            if ($null -eq $gk) { continue }
-            $d = Get-HaversineKm -Lat1 $gi.Lat -Lon1 $gi.Lon -Lat2 $gk.Lat -Lon2 $gk.Lon
-            if ($d -gt $MinDistanceKm) {
-                $detail = "Sessions {0} and {1} active {2:N0} km apart within {3} minutes ({4} / {5})" -f $si, $sk, $d, $ConcurrencyWindowMinutes, $gi.City, $gk.City
-                Add-Finding -Time $tK -User $login -Type "ConcurrentDistantSessions" -Detail $detail -Severity "Medium"
-                $reported = $true
-                break
-            }
+        $t = Get-EventTime $e
+        $recent = @($failures | Where-Object { ($t - $_) -le $window })
+        $failures = [System.Collections.Generic.List[datetime]]::new()
+        foreach ($f in $recent) { $failures.Add($f) }
+        $isFailure = $e.eventType -eq 'user.mfa.okta_verify.deny_push' -or ($e.eventType -eq 'user.authentication.auth_via_mfa' -and $e.outcome.result -eq 'FAILURE')
+        if ($isFailure) { $failures.Add($t) }
+        elseif ($e.outcome.result -eq 'SUCCESS' -and $failures.Count -ge $DenyThreshold) {
+            Add-Finding $e 'MfaDeniedThenApproved' 'High' ('{0} MFA failures then a success within {1} min' -f $failures.Count, $WindowMinutes)
+            break
         }
     }
 }
 
-# --- Output -------------------------------------------------------------------
-$sorted = @($findings | Sort-Object -Property Time -Descending)
+# Session used from several IPs
+$sessions = @{}
+foreach ($e in $events | Where-Object { $_.eventType -in 'user.session.start', 'user.authentication.sso' }) {
+    $sid = [string]$e.authenticationContext.externalSessionId
+    if (-not $sid -or $sid -eq 'unknown') { continue }
+    if (-not $sessions.ContainsKey($sid)) { $sessions[$sid] = [System.Collections.Generic.List[object]]::new() }
+    $sessions[$sid].Add($e)
+}
+foreach ($sid in $sessions.Keys) {
+    $list = @($sessions[$sid] | Sort-Object { Get-EventTime $_ })
+    $ips = @($list | ForEach-Object { [string]$_.client.ipAddress } | Where-Object { $_ } | Sort-Object -Unique)
+    if ($ips.Count -lt 2) { continue }
+    $geos = @($list | Where-Object { -not $_.securityContext.isProxy } | ForEach-Object { Get-GeoPoint $_ } | Where-Object { $_ })
+    $far = 0.0
+    for ($a = 0; $a -lt $geos.Count; $a++) {
+        for ($b = $a + 1; $b -lt $geos.Count; $b++) {
+            $far = [Math]::Max($far, (Get-HaversineKm $geos[$a].Lat $geos[$a].Lon $geos[$b].Lat $geos[$b].Lon))
+        }
+    }
+    $sev = if ($far -ge $MinDistanceKm) { 'High' } else { 'Low' }
+    $shortSid = $sid.Substring(0, [Math]::Min(10, $sid.Length))
+    $detail = "session $shortSid... used from $($ips.Count) IPs ($(($ips | Select-Object -First 4) -join ', '))"
+    if ($far -gt 0) { $detail += (', up to {0:N0} km apart' -f $far) }
+    Add-Finding $list[0] 'SessionIpChange' $sev $detail
+}
 
+$sorted = @($findings | Sort-Object Time, Type)
 if ($Json) {
-    $text = $sorted | ConvertTo-Json -Depth 10
-    if ($Output) { $text | Out-File -FilePath $Output -Encoding utf8 }
+    $text = ConvertTo-Json -InputObject $sorted -Depth 5
     Write-Output $text
-}
-else {
-    if ($Output) { $sorted | Format-Table -AutoSize | Out-String | Out-File -FilePath $Output -Encoding utf8 }
-    $sorted | Format-Table -AutoSize
+    if ($Output) { $text | Out-File -LiteralPath $Output -Encoding utf8 }
+} else {
+    $sorted | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Output
+    Write-Output "$($sorted.Count) findings from $($events.Count) events since $since"
+    if ($Output) { $sorted | Export-OktaCsv -Path $Output }
 }
