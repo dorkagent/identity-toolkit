@@ -131,3 +131,33 @@ Describe 'OAuth client assertion' {
         $ok | Should -BeTrue
     }
 }
+
+Describe 'OAuth token fetch' {
+    BeforeEach {
+        $script:savedToken = $env:OKTA_API_TOKEN
+        Remove-Item Env:OKTA_API_TOKEN -ErrorAction SilentlyContinue
+        $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+        $env:OKTA_CLIENT_ID = '0oaX'
+        $env:OKTA_PRIVATE_KEY = $rsa.ExportPkcs8PrivateKeyPem()
+        $env:OKTA_SCOPES = 'okta.users.read'
+        $script:tokenCalls = 0
+        Mock -ModuleName OktaClient Invoke-WebRequest {
+            if ($Uri -like '*/oauth2/v1/token') {
+                $script:tokenCalls++
+                return [pscustomobject]@{ StatusCode = 200; Headers = @{}; Content = '{"access_token":"at1","expires_in":3600}' }
+            }
+            [pscustomobject]@{ StatusCode = 200; Headers = @{}; Content = (ConvertTo-Json @{ auth = $Headers['Authorization'] } -Compress) }
+        }
+    }
+    AfterEach {
+        $env:OKTA_API_TOKEN = $script:savedToken
+        Remove-Item Env:OKTA_CLIENT_ID, Env:OKTA_PRIVATE_KEY, Env:OKTA_SCOPES -ErrorAction SilentlyContinue
+    }
+    It 'fetches a token on the first request of a new client and reuses it' {
+        $c = New-OktaClient
+        $c.AuthMode | Should -Be 'oauth'
+        (Invoke-OktaRequest -Client $c -Method GET -Path '/api/v1/users/x').auth | Should -Be 'Bearer at1'
+        $null = Invoke-OktaRequest -Client $c -Method GET -Path '/api/v1/users/y'
+        $script:tokenCalls | Should -Be 1
+    }
+}
