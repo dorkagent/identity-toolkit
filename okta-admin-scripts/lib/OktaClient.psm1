@@ -131,7 +131,9 @@ function New-OktaClient {
 function Update-OktaAccessToken {
     param([Parameter(Mandatory)][psobject]$Client)
     if ($Client.AuthMode -ne 'oauth') { return }
-    if ([datetime]::UtcNow -lt $Client.TokenExpires.AddSeconds(-60)) { return }
+    # Compare without touching TokenExpires: it starts at [datetime]::MinValue, and
+    # MinValue.AddSeconds(-60) throws, which broke every first OAuth request.
+    if ($Client.TokenExpires -gt [datetime]::UtcNow.AddSeconds(60)) { return }
     $tokenUrl = "$($Client.BaseUrl)/oauth2/v1/token"
     $assertion = New-OktaClientAssertion -ClientId $Client.OAuth.ClientId -TokenUrl $tokenUrl `
         -PrivateKeyPem $Client.OAuth.Key -KeyId $Client.OAuth.KeyId
