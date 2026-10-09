@@ -1,4 +1,4 @@
-"""Unit tests: secret scrubbing + atomic 0600 writes (P0-1, P0-7)."""
+"""Unit tests: secret scrubbing + atomic 0600 writes."""
 
 import csv
 import io
