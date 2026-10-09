@@ -198,11 +198,22 @@ def process_joiner(plan: Plan, row: dict) -> None:
     login = desired_profile(row)["login"]
     user = plan.client.get_user_by_login(login)
     if user is None:
-        created = plan.write(login, "create_user", "create user (staged, activate=false)",
-                             "post", "/api/v1/users?activate=false",
-                             {"profile": desired_profile(row)})
+        # Put the user in their OKTA_GROUP groups in the create call (groupIds).
+        # An admin whose role is scoped to groups may only create users inside
+        # those groups: a create without groupIds gets HTTP 403 for them, even
+        # when every group in the row is theirs.
+        names = parse_list(row.get("groups"))
+        at_create = [n for n in names
+                     if (plan.find_group(n) or {}).get("type") == "OKTA_GROUP"]
+        body = {"profile": desired_profile(row)}
+        detail = "create user (staged, activate=false)"
+        if at_create:
+            body["groupIds"] = [plan.find_group(n)["id"] for n in at_create]
+            detail += " in " + ", ".join(at_create)
+        created = plan.write(login, "create_user", detail,
+                             "post", "/api/v1/users?activate=false", body)
         uid = (created or {}).get("id")
-        add_groups(plan, login, uid, parse_list(row.get("groups")), {})
+        add_groups(plan, login, uid, [n for n in names if n not in at_create], {})
         add_apps(plan, login, uid, parse_list(row.get("apps")), {})
         return
     sync_profile(plan, login, user, row)
