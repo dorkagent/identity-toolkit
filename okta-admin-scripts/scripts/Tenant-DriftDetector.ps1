@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Captures, lists, and diffs read-only tenant configuration snapshots for drift detection.
@@ -14,12 +15,12 @@
                   zones      = full zone objects
                   authServers= full authorization server objects
                   apps       = id, label, name, signOnMode, assignedUserIds
-                  adminRoles = userId, login, roleType, grantDate
+                  adminRoles = userId, login, roleType, label, assignmentType, grantDate
                 The snapshots directory is created if missing.
 
-    -Diff <OldPath> <NewPath> : compare two snapshots grouped by resource type,
+    -Diff <OldPath>,<NewPath> : compare two snapshots grouped by resource type,
                 reporting added / removed / changed entries. Entries are keyed
-                by id; adminRoles entries are keyed by (userId, roleType).
+                by id; adminRoles entries are keyed by (userId, roleType, label, assignmentType).
                 Volatile fields (created, lastUpdated, _links, lastLogin,
                 statusChanged, passwordChanged) are ignored recursively.
                 Human-readable grouped +/-/~ output by default; -Json for
@@ -29,14 +30,16 @@
                 mode when no mode flag is given).
 
     Table output by default; -Json for machine-readable output; -Output writes
-    the report to a file. Requires OKTA_DOMAIN and OKTA_API_TOKEN environment
-    variables. Secrets are never hardcoded.
+    the report to a file. Only -Snapshot needs Okta credentials.
+
+    The snapshot format differs from tenant_drift_detector.py's, so diff
+    snapshots made by the same script.
 
 .PARAMETER Snapshot
     Capture a new tenant snapshot.
 
 .PARAMETER Diff
-    Two snapshot file paths to compare: -Diff <OldPath> <NewPath>.
+    Two snapshot file paths to compare: -Diff <OldPath>,<NewPath> (comma between the two paths).
 
 .PARAMETER List
     List snapshot files in -SnapshotDir.
@@ -55,7 +58,7 @@
     Capture the current tenant configuration to snapshots/.
 
 .EXAMPLE
-    .\Tenant-DriftDetector.ps1 -Diff .\snapshots\dev-123456-20260901-000000.json .\snapshots\dev-123456-20260928-000000.json
+    .\Tenant-DriftDetector.ps1 -Diff .\snapshots\dev-123456-20260901-000000.json,.\snapshots\dev-123456-20260928-000000.json
     Show what changed between two snapshots.
 
 .EXAMPLE
@@ -66,7 +69,7 @@
 [CmdletBinding(DefaultParameterSetName = "List")]
 param(
     [Parameter(ParameterSetName = "Snapshot")][switch]$Snapshot,
-    [Parameter(ParameterSetName = "Diff")][string[]]$Diff,
+    [Parameter(ParameterSetName = "Diff")][ValidateCount(2, 2)][string[]]$Diff,
     [Parameter(ParameterSetName = "List")][switch]$List,
     [string]$SnapshotDir = "./snapshots",
     [switch]$Json,
@@ -74,7 +77,7 @@ param(
 )
 
 Import-Module "$PSScriptRoot/../lib/OktaClient.psm1" -Force
-$client = New-OktaClient
+$ErrorActionPreference = 'Stop'
 
 $script:VolatileFields = @('created', 'lastUpdated', '_links', 'lastLogin', 'statusChanged', 'passwordChanged')
 
@@ -153,13 +156,13 @@ function Get-ChangedPaths {
 
 function Get-ResourceKey {
     param([string]$Type, $Item)
-    if ($Type -eq "adminRoles") { return "$($Item.userId)|$($Item.roleType)" }
+    if ($Type -eq "adminRoles") { return "$($Item.userId)|$($Item.roleType)|$($Item.label)|$($Item.assignmentType)" }
     return [string]$Item.id
 }
 
 function Get-ResourceLabel {
     param([string]$Type, $Item)
-    if ($Type -eq "adminRoles") { return "$($Item.login) : $($Item.roleType)" }
+    if ($Type -eq "adminRoles") { return "$($Item.login) : $($Item.roleType) $($Item.label) ($($Item.assignmentType))" }
     if ($Type -eq "apps") { return [string]$Item.label }
     return [string]$Item.name
 }
@@ -174,6 +177,7 @@ function Write-ReportText {
 # -Snapshot mode
 # =============================================================================
 if ($Snapshot) {
+    $client = New-OktaClient   # only snapshot mode talks to Okta
     if (-not (Test-Path $SnapshotDir)) {
         New-Item -ItemType Directory -Path $SnapshotDir -Force | Out-Null
     }
@@ -184,9 +188,14 @@ if ($Snapshot) {
     $file = Join-Path $SnapshotDir "$slug-$stamp.json"
 
     $policies = New-Object System.Collections.ArrayList
-    $policyTypes = @('PASSWORD', 'MFA_ENROLL', 'SIGN_ON', 'OAUTH_AUTHORIZATION_POLICY', 'IDP_DISCOVERY', 'POST_AUTH_SESSION')
+    # Values from the PolicyType enum. ACCESS_POLICY and POST_AUTH_SESSION
+    # exist only on Identity Engine; Classic orgs reject them, so a failure
+    # on one type is reported and skipped.
+    $policyTypes = @('OKTA_SIGN_ON', 'ACCESS_POLICY', 'PASSWORD', 'MFA_ENROLL', 'IDP_DISCOVERY', 'POST_AUTH_SESSION')
     foreach ($t in $policyTypes) {
-        foreach ($p in @(Get-OktaPolicies -Client $client -Type $t)) {
+        try { $found = @(Get-OktaPolicies -Client $client -Type $t) }
+        catch { Write-Warning "Skipped policy type $($t): $($_.Exception.Message)"; continue }
+        foreach ($p in $found) {
             $rules = New-Object System.Collections.ArrayList
             foreach ($r in @(Get-OktaPolicyRules -Client $client -PolicyId ([string]$p.id))) {
                 [void]$rules.Add([pscustomobject]@{
@@ -227,18 +236,21 @@ if ($Snapshot) {
     }
 
     $adminRoles = New-Object System.Collections.ArrayList
-    foreach ($u in @(Get-OktaUsers -Client $client -Status "")) {
-        foreach ($r in @(Get-OktaUserRoles -Client $client -UserId ([string]$u.id))) {
+    foreach ($uid in Get-OktaRoleAssigneeUserIds -Client $client) {
+        $u = Invoke-OktaRequest -Client $client -Method GET -Path "/api/v1/users/$uid"
+        foreach ($r in @(Get-OktaUserRoles -Client $client -UserId $uid)) {
             [void]$adminRoles.Add([pscustomobject]@{
-                userId    = [string]$u.id
-                login     = [string]$u.profile.login
-                roleType  = [string]$r.type
-                grantDate = [string]$r.created
+                userId         = $uid
+                login          = [string]$u.profile.login
+                roleType       = [string]$r.type
+                label          = [string]$r.label
+                assignmentType = [string]$r.assignmentType
+                grantDate      = ConvertTo-OktaIsoString $r.created
             })
         }
     }
 
-    $snapshot = [pscustomobject]@{
+    $snapshotDoc = [pscustomobject]@{
         meta = [pscustomobject]@{
             domain    = $client.BaseUrl
             timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
@@ -252,7 +264,8 @@ if ($Snapshot) {
         }
     }
 
-    $snapshot | ConvertTo-Json -Depth 20 | Out-File -FilePath $file -Encoding utf8
+    $snapshotDoc | ConvertTo-Json -Depth 20 | Out-File -LiteralPath $file -Encoding utf8
+    if (-not $IsWindows) { chmod 600 $file }   # the snapshot holds your whole policy setup
     Write-Output "Snapshot written to $file"
     exit 0
 }
@@ -367,6 +380,6 @@ if ($Json) {
     Write-ReportText (@($rows) | ConvertTo-Json -Depth 5)
 }
 else {
-    if ($Output) { @($rows) | Format-Table -AutoSize | Out-String | Out-File -FilePath $Output -Encoding utf8 }
+    if ($Output) { @($rows) | Format-Table -AutoSize | Out-String -Width 4096 | Out-File -LiteralPath $Output -Encoding utf8 }
     @($rows) | Format-Table -AutoSize
 }
