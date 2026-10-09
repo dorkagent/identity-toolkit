@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""License optimizer (DHQ-83). READ-ONLY.
+"""Rough per-app license waste estimate (read-only).
 
-Two views of license waste:
+Unused apps: one bounded pass over the System Log for user.authentication.sso
+events in the last --lookback-days (at most 90, which is all Okta keeps),
+counting sign-ins per app. Apps with assignments but no sign-ins in the window
+are listed with seats x --cost-default (or the per-app price from
+--cost-file, a JSON map of app label to monthly cost per seat).
 
-  1. UNUSED APP ASSIGNMENTS: single pass over the System Log
-     (eventType eq "user.authentication.sso" or eventType eq "user.session.start")
-     for the last --lookback-days (default 90). Login events are tallied per
-     app by matching event.target ids against known app ids. Apps with zero
-     logins but >0 assignments are waste candidates.
-  2. DUPLICATE IDENTITIES: ACTIVE users grouped by lowercased login and by
-     lowercased profile.email; groups of 2+ are reported.
+This is app-level only. Apps that never emit user.authentication.sso
+(bookmark apps, provisioning-only apps, some OIDC flows) will show as unused,
+so check before reclaiming anything. Okta's Application Usage report covers
+the same ground per user.
 
-Waste estimate: --cost-file JSON {appLabel: monthlyCostPerSeat} overrides the
---cost-default (default $10) per-seat monthly cost. Waste per app =
-unused seats * cost/seat. Results are ranked by estimated monthly waste.
+Shared mailboxes: ACTIVE users that share a profile.email are listed too.
+Logins are unique in Okta, so there is no duplicate-login check.
 
-Usage:
-    export OKTA_DOMAIN=https://dev-123456.okta.com
-    export OKTA_API_TOKEN=00...
-    python scripts/python/license_optimizer.py
-    python scripts/python/license_optimizer.py --lookback-days 180 --limit 10
-    python scripts/python/license_optimizer.py --cost-file costs.json
-    python scripts/python/license_optimizer.py --json --output waste.json
+Examples:
+    python scripts/license_optimizer.py
+    python scripts/license_optimizer.py --lookback-days 30 --cost-file costs.json --json
 """
 
 from __future__ import annotations
@@ -30,165 +26,99 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from lib.okta_client import OktaClient, OktaAuthError
+from lib.common import connect, log_window
+from lib.okta_client import OktaClient
+from lib.output import emit, table
 
-LOGIN_EVENTS_FILTER = (
-    'eventType eq "user.authentication.sso" '
-    'or eventType eq "user.session.start"'
-)
+# user.session.start targets the user, not an app, so only SSO events count.
+LOGIN_EVENTS_FILTER = 'eventType eq "user.authentication.sso"'
 
 
-def tally_logins(client: OktaClient, app_ids: set, since: str,
-                 progress_every: int = 5000):
-    """Single pass over the System Log; count login events per app id."""
+def tally_logins(client: OktaClient, app_ids: set, since: str, until: str) -> dict:
+    """Count SSO events per app id in one pass over the System Log."""
     logins = {aid: 0 for aid in app_ids}
-    n = 0
-    for event in client.list_logs(filter=LOGIN_EVENTS_FILTER, since=since):
-        n += 1
-        for target in event.get("target", []) or []:
-            tid = target.get("id")
-            if tid in logins:
-                logins[tid] += 1
-        if n % progress_every == 0:
-            print(f"... scanned {n} log events", file=sys.stderr)
+    for event in client.list_logs(filter=LOGIN_EVENTS_FILTER, since=since, until=until):
+        for target in event.get("target") or []:
+            if target.get("id") in logins:
+                logins[target["id"]] += 1
     return logins
 
 
-def find_duplicates(client: OktaClient, progress_every: int = 100):
-    by_login: dict[str, list] = {}
+def find_shared_emails(client: OktaClient) -> list[dict]:
     by_email: dict[str, list] = {}
-    for n, user in enumerate(client.list_users(status="ACTIVE"), 1):
-        profile = user.get("profile", {})
-        login = (profile.get("login") or "").lower()
+    for user in client.list_users(status="ACTIVE"):
+        profile = user.get("profile") or {}
         email = (profile.get("email") or "").lower()
-        if login:
-            by_login.setdefault(login, []).append(profile.get("login"))
         if email:
             by_email.setdefault(email, []).append(profile.get("login"))
-        if n % progress_every == 0:
-            print(f"... scanned {n} users", file=sys.stderr)
-    dupes = []
-    for key, members in by_login.items():
-        if len(members) >= 2:
-            dupes.append({"field": "login", "value": key, "logins": members})
-    for key, members in by_email.items():
-        if len(members) >= 2:
-            dupes.append({"field": "email", "value": key, "logins": members})
-    return dupes
+    return [{"email": k, "logins": v} for k, v in sorted(by_email.items()) if len(v) > 1]
 
 
 def optimize(client: OktaClient, lookback_days: int, costs: dict,
-             cost_default: float, limit: int = 0, progress_every: int = 25):
-    cutoff = (datetime.now(timezone.utc)
-              - timedelta(days=lookback_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    apps = list(client.list_apps())
-    app_ids = {a.get("id") for a in apps if a.get("id")}
-    logins = tally_logins(client, app_ids, since=cutoff)
-
+             cost_default: float, limit: int = 0):
+    since, until, _ = log_window(lookback_days)
+    apps = [a for a in client.list_apps() if a.get("status") != "INACTIVE"]
+    if limit:
+        apps = apps[:limit]
+    logins = tally_logins(client, {a["id"] for a in apps}, since, until)
     waste = []
-    for n, app in enumerate(apps, 1):
-        if limit and n > limit:
-            break
-        app_id = app.get("id")
-        label = app.get("label")
-        if logins.get(app_id, 0) > 0:
+    for app in apps:
+        if logins.get(app["id"], 0) > 0:
             continue
-        assignments = sum(1 for _ in client.list_app_users(app_id))
-        if assignments == 0:
+        seats = sum(1 for _ in client.list_app_users(app["id"]))
+        if seats == 0:
             continue
-        cost = costs.get(label, cost_default)
-        waste.append({
-            "app": label,
-            "app_id": app_id,
-            "logins_in_window": 0,
-            "unused_seats": assignments,
-            "cost_per_seat": cost,
-            "est_monthly_waste": round(assignments * cost, 2),
-        })
-        if n % progress_every == 0:
-            print(f"... checked {n} apps", file=sys.stderr)
+        cost = float(costs.get(app.get("label"), cost_default))
+        waste.append({"app": app.get("label"), "app_id": app["id"],
+                      "unused_seats": seats, "cost_per_seat": cost,
+                      "est_monthly_waste": round(seats * cost, 2)})
     waste.sort(key=lambda w: w["est_monthly_waste"], reverse=True)
-
-    duplicates = find_duplicates(client)
-    return waste, duplicates, cutoff
+    return waste, find_shared_emails(client), since
 
 
-def print_tables(waste: list, duplicates: list, cutoff: str,
-                 lookback_days: int):
-    print(f"Apps with zero login events since {cutoff} ({lookback_days}d lookback):")
-    print(f"{'APP':40} {'UNUSED SEATS':>12} {'COST/SEAT':>10} {'EST MONTHLY WASTE':>18}")
-    print("-" * 84)
-    for w in waste:
-        print(f"{(w['app'] or '')[:40]:40} {w['unused_seats']:>12} "
-              f"${w['cost_per_seat']:>9.2f} ${w['est_monthly_waste']:>17.2f}")
+def render(waste: list, shared: list, since: str) -> str:
+    lines = [f"Apps with assignments and no SSO sign-ins since {since}:",
+             table([("APP", 40), ("SEATS", 6), ("$/SEAT", 8), ("$/MONTH", 0)],
+                   [[w["app"], w["unused_seats"], f"{w['cost_per_seat']:.2f}",
+                     f"{w['est_monthly_waste']:.2f}"] for w in waste])]
     total = sum(w["est_monthly_waste"] for w in waste)
-    print(f"\nEstimated total monthly waste: ${total:,.2f} across {len(waste)} apps")
-
-    print("\nDuplicate identities (ACTIVE users, groups of 2+):")
-    if not duplicates:
-        print("  none found")
-    for d in duplicates:
-        print(f"  {d['field']}={d['value']}: {', '.join(d['logins'])}")
+    lines.append(f"\nEstimated monthly waste: ${total:,.2f} across {len(waste)} apps")
+    lines.append("\nActive users sharing an email address:")
+    lines += [f"  {d['email']}: {', '.join(d['logins'])}" for d in shared] or ["  none"]
+    return "\n".join(lines)
 
 
-def main():
-    p = argparse.ArgumentParser(
-        description="Find unused app assignments and duplicate identities. READ-ONLY.")
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Estimate license waste from apps with "
+                                "no recent SSO sign-ins (read-only).")
     p.add_argument("--lookback-days", type=int, default=90,
-                   help="System Log lookback window in days (default 90)")
-    p.add_argument("--limit", type=int, default=0,
-                   help="only check N apps (0 = all)")
-    p.add_argument("--cost-file", default=None,
-                   help="JSON file mapping app label -> monthly cost per seat")
+                   help="days of System Log to read (default 90, the most Okta keeps)")
+    p.add_argument("--limit", type=int, default=0, help="only check the first N apps")
+    p.add_argument("--cost-file", help="JSON map of app label to monthly cost per seat")
     p.add_argument("--cost-default", type=float, default=10,
-                   help="default monthly cost per seat (default 10)")
-    p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
-    p.add_argument("--output", default=None, help="write report to file")
-    args = p.parse_args()
+                   help="monthly cost per seat when not in --cost-file (default 10)")
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.add_argument("--output", help="write the report here (.csv for CSV)")
+    args = p.parse_args(argv)
 
     costs = {}
     if args.cost_file:
         with open(args.cost_file, encoding="utf-8") as f:
             costs = json.load(f)
+    if args.lookback_days > 90:
+        print("note: the System Log keeps 90 days; using 90", file=sys.stderr)
 
-    try:
-        client = OktaClient()
-    except OktaAuthError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    waste, duplicates, cutoff = optimize(
-        client, lookback_days=args.lookback_days, costs=costs,
-        cost_default=args.cost_default, limit=args.limit)
-
-    total = round(sum(w["est_monthly_waste"] for w in waste), 2)
-    summary = {"lookback_days": args.lookback_days, "since": cutoff,
-               "waste_apps": len(waste), "est_total_monthly_waste": total,
-               "duplicate_groups": len(duplicates)}
-
-    if args.json:
-        report = json.dumps({"summary": summary, "waste": waste,
-                             "duplicates": duplicates}, indent=2)
-    else:
-        print_tables(waste, duplicates, cutoff, args.lookback_days)
-        report_lines = [
-            "",
-            f"Waste apps: {summary['waste_apps']} | "
-            f"est monthly waste: ${total:,.2f} | "
-            f"duplicate groups: {summary['duplicate_groups']}",
-        ]
-        report = "\n".join(report_lines)
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(report if args.json else report + "\n")
-        print(f"\nwrote {args.output}", file=sys.stderr)
-    elif not args.json:
-        print(report)
+    waste, shared, since = optimize(connect(), args.lookback_days, costs,
+                                    args.cost_default, args.limit)
+    summary = {"since": since, "unused_apps": len(waste),
+               "est_monthly_waste": round(sum(w["est_monthly_waste"] for w in waste), 2),
+               "shared_emails": len(shared)}
+    emit(report={"summary": summary, "unused_apps": waste, "shared_emails": shared},
+         text=render(waste, shared, since), as_json=args.json,
+         output=args.output, csv_rows=waste)
 
 
 if __name__ == "__main__":
