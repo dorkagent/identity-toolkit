@@ -30,7 +30,7 @@ def _utcnow() -> str:
 def _actor() -> str:
     try:
         return getpass.getuser()
-    except Exception:
+    except (OSError, KeyError, ImportError):
         return os.environ.get("USER") or os.environ.get("USERNAME") or "?"
 
 
