@@ -81,8 +81,33 @@ def test_joiner_apply_continues_with_new_user_id(client, fake):
     create = fake.called("POST", "/api/v1/users")[0]
     assert create["params"]["activate"] == "false"
     assert create["json"]["profile"]["email"] == "ann@x"   # falls back to login
-    assert fake.called("PUT", "/api/v1/groups/00gENG/users/00uNEW")
+    # Groups go in the create call, so a group-scoped admin is allowed to create.
+    assert create["json"]["groupIds"] == ["00gENG"]
+    assert not fake.called("PUT", "/api/v1/groups/00gENG/users/00uNEW")
     assert fake.called("POST", "/api/v1/apps/0oaSLACK/users")[0]["json"] == {"id": "00uNEW"}
+
+
+def test_joiner_create_only_puts_okta_groups_in_group_ids(client, fake):
+    # Found live (Oct 2026): a custom admin role scoped to a group gets HTTP 403 on
+    # POST /api/v1/users without groupIds, even when the row's groups are its own.
+    fake.pages("/api/v1/users", [[]])
+    fake.add("POST", "/api/v1/users", {"id": "00uNEW"})
+    fake.pages("/api/v1/groups", [[group("00gENG", "Engineering"),
+                                   group("00gAD", "AD Staff", "APP_GROUP")]])
+    actions = jml.run(client, [ROW | {"groups": "Engineering;AD Staff;Nope", "apps": ""}],
+                      "joiner", apply=True, do_prune=False)
+    create = fake.called("POST", "/api/v1/users")[0]
+    assert create["json"]["groupIds"] == ["00gENG"]
+    assert fake.called("PUT", "/api/v1/groups/00gAD/users/00uNEW") == []
+    errors = sorted(a["detail"] for a in actions if a["status"] == "error")
+    assert errors[0].startswith("AD Staff is APP_GROUP") and errors[1] == "group not found: Nope"
+
+
+def test_joiner_create_without_groups_sends_no_group_ids(client, fake):
+    fake.pages("/api/v1/users", [[]])
+    fake.add("POST", "/api/v1/users", {"id": "00uNEW"})
+    jml.run(client, [ROW | {"groups": "", "apps": ""}], "joiner", apply=True, do_prune=False)
+    assert "groupIds" not in fake.called("POST", "/api/v1/users")[0]["json"]
 
 
 def test_dry_run_writes_nothing(client, fake):
