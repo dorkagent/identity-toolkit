@@ -1,4 +1,4 @@
-"""Unit tests: ImmutableID / source-anchor verifier (P1-1).
+"""Unit tests: ImmutableID / source-anchor verifier.
 
 The core computation is verified against Microsoft's documentation, not
 model memory:
