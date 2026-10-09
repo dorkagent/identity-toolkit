@@ -1,4 +1,4 @@
-"""Unit tests: id-based group existence ledger (P0-5)."""
+"""Unit tests: id-based group existence ledger."""
 
 import unittest
 
