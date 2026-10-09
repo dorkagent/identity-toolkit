@@ -100,8 +100,14 @@ def protected_accounts(client: OktaClient, exclude_groups: list[str]) -> dict[st
             if tok.get("userId"):
                 protected.setdefault(tok["userId"], f"owns API token '{tok.get('name')}'")
     except OktaForbiddenError:
-        print("warning: cannot list API tokens (needs super admin); only the "
-              "current token's owner is protected", file=sys.stderr)
+        if me:
+            who = "only the current token's owner is protected"
+        else:
+            # OAuth service apps have no user behind them, so nothing is protected here.
+            who = ("no API token owners are protected (an OAuth service app has no "
+                   "token owner); list them in --exclude-file")
+        print(f"warning: cannot list API tokens (needs super admin and, for OAuth, "
+              f"okta.apiTokens.read); {who}", file=sys.stderr)
 
     try:
         for uid in client.list_role_assignee_user_ids():
