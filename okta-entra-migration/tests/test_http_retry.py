@@ -1,4 +1,4 @@
-"""Unit tests: rate-limit math (P0-3). No network; pure functions only."""
+"""Unit tests: rate-limit math. No network; pure functions only."""
 
 import time
 import unittest
