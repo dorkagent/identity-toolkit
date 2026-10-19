@@ -10,6 +10,9 @@ Standalone PowerShell + Python scripts for the problems IAM teams hit every week
 ### `okta-entra-migration/` — Okta → Entra migration planning toolkit
 Free, offline-first toolkit: export a complete Okta tenant inventory and plan the move to Microsoft Entra ID. Covers user export/matching, group mirroring (including Okta dynamic-rule → Entra dynamic-membership translation), app-migration planning with an IdP/SP mapping handoff for app owners, service-account inventory, ImmutableID verification, and a per-app cutover tracker. See [its README](okta-entra-migration/README.md) for the full capability and maturity table.
 
+### `ai-agent-identity/` — enterprise AI-agent identity governance
+Report-only risk review of the non-human identities an AI-agent deployment touches: API tokens, OAuth service apps, and service-account users, scored against a deterministic rubric (never-expiring, orphaned, admin-linked, over-broad scopes). Ships with an MCP tool-permission review checklist and a STRIDE-style threat model for agentic deployments. Reads the same okta-inventory.json contract; no live calls, no credentials needed. See [its README](ai-agent-identity/README.md).
+
 ## Honesty notes
 
 - The migration toolkit's `--apply` paths have unit tests and fixture-driven checks but have **never been run against a live tenant**. Treat them as reviewed-but-unproven until a lab tenant says otherwise.
